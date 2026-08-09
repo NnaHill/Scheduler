@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* "Download as PDF" on the Instructions tab is just the browser's own
+   print dialog (Save as PDF) — no extra library needed. Since each tab's
+   content only exists in the DOM while it's active, hiding the app chrome
+   (header, tab bar) is all print CSS has to do; whatever tab is showing
+   prints as-is. */
+@media print {
+  .print-hide {
+    display: none !important;
+  }
+}
