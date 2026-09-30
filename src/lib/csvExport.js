@@ -1,7 +1,7 @@
 // Exports a generated schedule to CSV — one row per employee, one
 // column per day. Mirrors the Schedule tab's cellFor logic exactly
-// (shift code, "PTO-1"/"PTO-2", "OFF", or a trailing "*" for a PTO-2
-// override) so the download always matches what's on screen.
+// (shift code, "PTO-1"/"PTO-2"/"WKND", "OFF", or a trailing "*" for a
+// PTO-2 override) so the download always matches what's on screen.
 
 function csvEscape(value) {
   const s = String(value ?? "");
@@ -9,24 +9,27 @@ function csvEscape(value) {
   return s;
 }
 
-function cellForCsv(employee, day, ptoStatus, key, shiftLabelFn) {
+function cellForCsv(employee, day, ptoStatus, ptoSource, key, shiftLabelFn) {
   const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
   if (entry) return entry[1].override ? `${shiftLabelFn(entry[0])}*` : shiftLabelFn(entry[0]);
-  const st = ptoStatus[key(employee.id, day.idx)];
-  if (st === "PTO1") return "PTO-1";
+  const k = key(employee.id, day.idx);
+  const st = ptoStatus[k];
+  // Same distinction the Schedule tab's grid makes: a weekend blocked by
+  // rotation isn't approved leave, so it gets its own code here too.
+  if (st === "PTO1") return ptoSource[k] === "weekend_rotation" ? "WKND" : "PTO-1";
   if (st === "PTO2") return "PTO-2";
   if (employee.type === "extra") return "";
   return "OFF";
 }
 
-export function buildScheduleCsv({ schedule, permanent, extra, ptoStatus, holidays, key, shiftLabel }) {
+export function buildScheduleCsv({ schedule, permanent, extra, ptoStatus, ptoSource, holidays, key, shiftLabel }) {
   const shiftLabelFn = shiftLabel || ((code) => code);
   const rows = [];
   rows.push(["Employee", "Type", ...schedule.days.map((d) => `${d.wd} ${d.md}${holidays.has(d.iso) ? " (HOL)" : ""}`)]);
 
   const addSection = (list, typeLabel) => {
     list.forEach((emp) => {
-      rows.push([emp.name, typeLabel, ...schedule.days.map((d) => cellForCsv(emp, d, ptoStatus, key, shiftLabelFn))]);
+      rows.push([emp.name, typeLabel, ...schedule.days.map((d) => cellForCsv(emp, d, ptoStatus, ptoSource, key, shiftLabelFn))]);
     });
   };
   addSection(permanent, "Permanent");

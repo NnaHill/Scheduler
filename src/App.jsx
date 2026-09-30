@@ -257,9 +257,21 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // internal identifier, never shown unless a shift has no custom name.
   const addShiftDefinition = () => {
     const nextNum = Math.max(0, ...shiftDefinitions.map((d) => Number(/^E(\d+)$/.exec(d.code)?.[1]) || 0)) + 1;
-    const newDef = { code: `E${nextNum}`, label: null, sortOrder: shiftDefinitions.length, activeWeekend: false, collapsed: false, continuityMin: null, continuityMax: null };
+    const code = `E${nextNum}`;
+    const newDef = { code, label: null, sortOrder: shiftDefinitions.length, activeWeekend: false, collapsed: false, continuityMin: null, continuityMax: null };
     setShiftDefinitions((prev) => [...prev, newDef]);
     upsertShiftDefinition(newDef, viewingOwnerId).catch(reportSyncError);
+    // Permanent staff default to "trained on everything" (see addPermanent)
+    // — a newly added shift should keep that default true for them, same
+    // as it implicitly always was before per-shift training existed. PRN
+    // staff are deliberately left out here: their training has always been
+    // a curated whitelist the manager sets by hand, never "everything".
+    setEmployees((prev) => prev.map((e) => {
+      if (e.type !== "permanent") return e;
+      const updated = { ...e, allowedShifts: [...e.allowedShifts, code] };
+      upsertEmployee(updated, viewingOwnerId).catch(reportSyncError);
+      return updated;
+    }));
   };
   const removeShiftDefinition = (code) => {
     if (!window.confirm(`Remove shift ${shiftLabel(code)}? Any employee trained on it, or past schedules using it, are unaffected — it just won't be used going forward.`)) return;
@@ -293,6 +305,18 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     setEmployees((prev) => prev.map((e) => {
       if (e.id !== empId) return e;
       const updated = { ...e, weekendRotation: rotation };
+      upsertEmployee(updated, viewingOwnerId).catch(reportSyncError);
+      return updated;
+    }));
+  // Which shifts a permanent employee is trained/qualified for — same
+  // field PRN staff already use (allowedShifts), just editable after the
+  // fact instead of only set at creation. New employees default to every
+  // shift checked (see addPermanent), so turning this on never silently
+  // excludes anyone until a manager actively unchecks something.
+  const toggleEmployeeAllowedShift = (empId, code) =>
+    setEmployees((prev) => prev.map((e) => {
+      if (e.id !== empId) return e;
+      const updated = { ...e, allowedShifts: e.allowedShifts.includes(code) ? e.allowedShifts.filter((c) => c !== code) : [...e.allowedShifts, code] };
       upsertEmployee(updated, viewingOwnerId).catch(reportSyncError);
       return updated;
     }));
@@ -530,8 +554,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         const underCap = (e) => !wouldExceedShiftCap(e, workedDaysByEmp[e.id], blockDayIndices);
         const blockDows = blockDays.map((d) => d.dow);
         const fitsFixedDays = (e) => respectsFixedDayRestriction(e, blockDows);
-        const tier1 = permanent.filter((e) => blockDays.every((d) => !ptoStatus[key(e.id, d.idx)]) && underCap(e) && fitsFixedDays(e) && !isCommitted(`p:${e.id}`, blockDays));
-        const tier2 = permanent.filter((e) => !anyPto1(e) && blockDays.some((d) => ptoStatus[key(e.id, d.idx)] === "PTO2") && underCap(e) && fitsFixedDays(e) && !isCommitted(`p:${e.id}`, blockDays));
+        const tier1 = permanent.filter((e) => e.allowedShifts.includes(code) && blockDays.every((d) => !ptoStatus[key(e.id, d.idx)]) && underCap(e) && fitsFixedDays(e) && !isCommitted(`p:${e.id}`, blockDays));
+        const tier2 = permanent.filter((e) => e.allowedShifts.includes(code) && !anyPto1(e) && blockDays.some((d) => ptoStatus[key(e.id, d.idx)] === "PTO2") && underCap(e) && fitsFixedDays(e) && !isCommitted(`p:${e.id}`, blockDays));
         const sortFn = (a, b) => stat[a.id] - stat[b.id] || Math.random() - 0.5;
         let chosen = null, type = "permanent", override = false;
         if (tier1.length) { tier1.sort(sortFn); chosen = tier1[0]; }
@@ -589,7 +613,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         && !wouldExceedConsecutiveDays([...projectedFixedDayIndices[e.id], ...workedDaysByEmp[e.id]], [day.idx], consecutiveHardLimit ? maxConsecutiveDays : 0));
       if (!candidates.length) return;
       const match = kuhnMatch(activeShifts, (shift) =>
-        candidates.map((e) => e.id).sort((a, b) => stat[a] - stat[b] || Math.random() - 0.5));
+        candidates.filter((e) => e.allowedShifts.includes(shift)).map((e) => e.id).sort((a, b) => stat[a] - stat[b] || Math.random() - 0.5));
       Object.entries(match).forEach(([shift, empId]) => {
         if (!dayAssignment[day.idx]) dayAssignment[day.idx] = {};
         dayAssignment[day.idx][shift] = { empId, type: "permanent", override: false, fixed: true };
@@ -633,7 +657,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const fixedToday = permanent.filter((e) => e.fixedDays.includes(day.dow) && statusOf(e.id) !== "PTO1" && underCap(e) && underStreak(e));
     if (fixedToday.length && remaining.length) {
       const match = kuhnMatch(remaining, (shift) =>
-        fixedToday.filter((e) => !usedIds.has(e.id)).map((e) => e.id)
+        fixedToday.filter((e) => !usedIds.has(e.id) && e.allowedShifts.includes(shift)).map((e) => e.id)
           .sort((a, b) => shiftPref(stats[a], shift) - shiftPref(stats[b], shift) || Math.random() - 0.5));
       Object.entries(match).forEach(([shift, empId]) => { assignment[shift] = { empId, type: "permanent", override: false, fixed: true }; usedIds.add(empId); });
       remaining = remaining.filter((s) => !(s in match));
@@ -641,13 +665,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     if (remaining.length) {
       const pool = permanent.filter((e) => !usedIds.has(e.id) && !statusOf(e.id) && underCap(e) && underStreak(e) && respectsFixedDayRestriction(e, [day.dow]));
       const costFn = (id, shift) => shiftPref(stats[id], shift) + (isWknd ? stats[id].weekendCount * 1000 : 0) + stats[id].totalWorked * 10;
-      const match = kuhnMatch(remaining, (shift) => pool.filter((e) => !usedIds.has(e.id)).map((e) => e.id).sort((a, b) => costFn(a, shift) - costFn(b, shift) || Math.random() - 0.5));
+      const match = kuhnMatch(remaining, (shift) => pool.filter((e) => !usedIds.has(e.id) && e.allowedShifts.includes(shift)).map((e) => e.id).sort((a, b) => costFn(a, shift) - costFn(b, shift) || Math.random() - 0.5));
       Object.entries(match).forEach(([shift, empId]) => { assignment[shift] = { empId, type: "permanent", override: false, fixed: false }; usedIds.add(empId); });
       remaining = remaining.filter((s) => !(s in match));
     }
     if (remaining.length) {
       const pool2 = permanent.filter((e) => !usedIds.has(e.id) && statusOf(e.id) === "PTO2" && underCap(e) && underStreak(e) && respectsFixedDayRestriction(e, [day.dow]));
-      const match = kuhnMatch(remaining, (shift) => pool2.filter((e) => !usedIds.has(e.id)).map((e) => e.id).sort((a, b) => stats[a].totalWorked - stats[b].totalWorked || Math.random() - 0.5));
+      const match = kuhnMatch(remaining, (shift) => pool2.filter((e) => !usedIds.has(e.id) && e.allowedShifts.includes(shift)).map((e) => e.id).sort((a, b) => stats[a].totalWorked - stats[b].totalWorked || Math.random() - 0.5));
       Object.entries(match).forEach(([shift, empId]) => { assignment[shift] = { empId, type: "permanent", override: true, fixed: false }; usedIds.add(empId); });
       remaining = remaining.filter((s) => !(s in match));
     }
@@ -713,14 +737,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       if (wd.length) maxGap = Math.max(maxGap, totalDaysCount - 1 - wd[wd.length - 1]);
       if (totalDaysCount > 28 && maxGap > 28) weekendViol++;
     });
-    // Every permanent employee should work each active shift at least
-    // once this rotation — but only if they had any non-blocked day to
-    // work it on at all (skip anyone on leave for the whole span).
+    // Every permanent employee should work each active shift they're
+    // TRAINED ON at least once this rotation — but only if they had any
+    // non-blocked day to work it on at all (skip anyone on leave for the
+    // whole span). A shift they're not trained for isn't a gap, so it's
+    // excluded before checking, same as it's simply never offered to
+    // them during matching.
     let missingShiftPenalty = 0;
     permanent.forEach((e) => {
       const hasAvailability = daysArr.some((d) => ptoStatus[key(e.id, d.idx)] !== "PTO1");
       if (!hasAvailability) return;
-      weekdayShifts.forEach((s) => { if (stats[e.id].shiftCount[s] === 0) missingShiftPenalty++; });
+      weekdayShifts.filter((s) => e.allowedShifts.includes(s)).forEach((s) => { if (stats[e.id].shiftCount[s] === 0) missingShiftPenalty++; });
     });
     // In hard mode this always evaluates to 0 — the hard checks in
     // assignDay/assignWeekendRotationGuarantees never let a run form in
@@ -754,13 +781,22 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         while (idx2 === idx1) idx2 = Math.floor(Math.random() * entries.length);
         const [shift1, info1] = entries[idx1];
         const [shift2, info2] = entries[idx2];
-        trialAssignment[shift1] = { ...info1, empId: info2.empId };
-        trialAssignment[shift2] = { ...info2, empId: info1.empId };
-        mutated = true;
+        // A swap only ever made sense before because any permanent
+        // employee could work any shift — now that training restricts
+        // that, confirm both people are actually qualified for the shift
+        // they'd be swapped INTO before trying it.
+        const emp1 = permanent.find((e) => e.id === info1.empId);
+        const emp2 = permanent.find((e) => e.id === info2.empId);
+        if (emp2?.allowedShifts.includes(shift1) && emp1?.allowedShifts.includes(shift2)) {
+          trialAssignment[shift1] = { ...info1, empId: info2.empId };
+          trialAssignment[shift2] = { ...info2, empId: info1.empId };
+          mutated = true;
+        }
       } else if (moveType === "B" && entries.length >= 1) {
         const [shiftX, infoX] = entries[Math.floor(Math.random() * entries.length)];
         const usedIds = new Set(Object.values(day.assignment).map((v) => v.empId));
         const candidatesY = permanent.filter((e) => !usedIds.has(e.id) && !e.fixedDays.includes(day.dow) && !ptoStatus[key(e.id, day.idx)]
+          && e.allowedShifts.includes(shiftX)
           && !wouldExceedShiftCap(e, workedDayIndicesFromSchedule(current, e.id), [day.idx])
           && !wouldExceedConsecutiveDays(workedDayIndicesFromSchedule(current, e.id), [day.idx], consecutiveHardLimit ? maxConsecutiveDays : 0)
           && respectsFixedDayRestriction(e, [day.dow]));
@@ -908,10 +944,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         if (wd.length) maxGap = Math.max(maxGap, totalDays - 1 - wd[wd.length - 1]);
         const weekendRuleBroken = totalDays > 28 && maxGap > 28;
         const hasAvailability = optimizedDays.some((d) => ptoStatus[key(e.id, d.idx)] !== "PTO1");
-        const missingShifts = hasAvailability ? weekdayShifts.filter((s) => st.shiftCount[s] === 0) : [];
+        const missingShifts = hasAvailability ? weekdayShifts.filter((s) => e.allowedShifts.includes(s) && st.shiftCount[s] === 0) : [];
         const longestRun = longestConsecutiveRun(st.workedDays);
         const longestRunExceeded = maxConsecutiveDays > 0 && longestRun > maxConsecutiveDays;
-        return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded };
+        return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, allowedShifts: e.allowedShifts, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded };
       });
       const extraFairness = extra.map((e) => {
         const total = optimizedDays.reduce((sum, d) => sum + Object.values(d.assignment).filter((a) => a.empId === e.id && a.type === "extra").length, 0);
@@ -949,8 +985,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const cellFor = (employee, day) => {
     const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
     if (entry) return { code: entry[0], override: entry[1].override };
-    const st = ptoStatus[key(employee.id, day.idx)];
-    if (st === "PTO1") return { code: "PTO-1" };
+    const k = key(employee.id, day.idx);
+    const st = ptoStatus[k];
+    // A weekend blocked off by their rotation cycle isn't the same thing
+    // as approved time off — same hard-block effect on the matcher, but
+    // a manager reading the grid needs to tell "on leave" from "just not
+    // their weekend" at a glance, so it gets its own code here.
+    if (st === "PTO1") return { code: ptoSource[k] === "weekend_rotation" ? "WKND" : "PTO-1" };
     if (st === "PTO2") return { code: "PTO-2" };
     if (employee.type === "extra") return { code: "" };
     return { code: "OFF" };
@@ -981,14 +1022,14 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 const { code, override } = cellFor(emp, d);
                 const isShift = ALL_SHIFT_CODES.includes(code);
                 const displayText = code === "OFF" ? "" : isShift ? shiftLabel(code) : code;
-                const bg = isShift ? getShiftColor(code) : code === "PTO-1" ? "#DC2626" : code === "PTO-2" ? "#F59E0B" : code === "OFF" ? "#E4E7EC" : "transparent";
-                const fg = isShift || code === "PTO-1" || code === "PTO-2" ? "#fff" : "#64748B";
+                const bg = isShift ? getShiftColor(code) : (code === "PTO-1" || code === "WKND") ? "#DC2626" : code === "PTO-2" ? "#F59E0B" : code === "OFF" ? "#E4E7EC" : "transparent";
+                const fg = isShift || code === "PTO-1" || code === "WKND" || code === "PTO-2" ? "#fff" : "#64748B";
                 return (
                   <td key={d.idx} className="border-b border-[#F1F5F9] p-0.5 text-center">
                     <div
                       className="w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"
-                      style={{ background: bg, color: fg, fontSize: gridCellFontSize(displayText), border: override ? "2px dashed #F59E0B" : isContinuityCode(code) ? "2px solid #1A2233" : "none" }}
-                      title={isShift && displayText !== code ? code : undefined}
+                      style={{ background: bg, color: fg, fontSize: gridCellFontSize(displayText), border: override ? "2px dashed #F59E0B" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none" }}
+                      title={code === "WKND" ? "Off per weekend rotation — not approved leave" : isShift && displayText !== code ? code : undefined}
                     >
                       {displayText}{override ? "*" : ""}
                     </div>
@@ -1403,7 +1444,33 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   </table>
                 </div>
               )}
-              {feasibility.overall.shortfall === 0 && !feasibility.weekends.some((w) => w.shortfall > 0) && !feasibility.holidays.some((h) => h.shortfall > 0) && (
+              {feasibility.byShift.some((s) => s.shortfall > 0) && (
+                <div>
+                  <div className="text-xs font-semibold mb-1 text-[#DC2626]">⚠ Short on staff trained for a specific shift</div>
+                  <p className="text-[11px] text-[#64748B] mb-1">The totals above are headcount only — this checks whether enough of that headcount is actually trained on each shift. A "fully staffed" total can still hide a shortage here.</p>
+                  <table className="text-xs border-collapse">
+                    <thead>
+                      <tr className="text-[#64748B]">
+                        <th className="text-left pr-4 py-1">Shift</th>
+                        <th className="text-right pr-4 py-1">Required</th>
+                        <th className="text-right pr-4 py-1">Trained &amp; available (perm + PRN)</th>
+                        <th className="text-right py-1">Short</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {feasibility.byShift.filter((s) => s.shortfall > 0).map((s) => (
+                        <tr key={s.code} className="border-t border-[#F1F5F9]">
+                          <td className="pr-4 py-1">{shiftLabel(s.code)}</td>
+                          <td className="text-right pr-4 py-1">{s.required}</td>
+                          <td className="text-right pr-4 py-1">{s.availablePermanent} + {s.availablePrn}</td>
+                          <td className="text-right py-1 text-[#DC2626] font-semibold">{s.shortfall}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {feasibility.overall.shortfall === 0 && !feasibility.weekends.some((w) => w.shortfall > 0) && !feasibility.holidays.some((h) => h.shortfall > 0) && !feasibility.byShift.some((s) => s.shortfall > 0) && (
                 <div className="text-xs text-[#0D9488] font-semibold">✓ No capacity shortfall detected for this rotation.</div>
               )}
             </div>
@@ -1606,6 +1673,19 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                         </span>
                       )}
                     </div>
+                    <div className="flex items-center gap-2 flex-wrap pl-1">
+                      <label className="text-[11px] text-[#64748B]">Trained on (unchecking excludes them from that shift):</label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {ALL_SHIFT_CODES.map((s) => {
+                          const active = emp.allowedShifts.includes(s);
+                          return (
+                            <button key={s} onClick={() => toggleEmployeeAllowedShift(emp.id, s)}
+                              className="px-2.5 py-1 rounded text-[11px] font-mono font-semibold border"
+                              style={active ? { background: getShiftColor(s), borderColor: getShiftColor(s), color: "#fff" } : { borderColor: "#E4E7EC", color: "#94A3B8" }}>{shiftLabel(s)}</button>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1655,7 +1735,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                                 className="w-6 h-6 rounded-sm"
                                 style={{
                                   background: st === "PTO1" ? "#DC2626" : st === "PTO2" ? "#F59E0B" : d.isWeekend ? "#F1F5F9" : "#F8FAFC",
-                                  border: autoGenerated ? "2px dashed #7C3AED" : "1px solid #E4E7EC",
+                                  border: autoGenerated ? "2px dashed #7C3AED" : (st === "PTO1" || st === "PTO2") ? "3px solid #000" : "1px solid #E4E7EC",
                                 }}
                               />
                             </td>
@@ -1789,9 +1869,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               {ALL_SHIFT_CODES.map((s) => <div key={s} className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ background: getShiftColor(s) }} />{shiftLabel(s)}{isContinuityCode(s) ? "†" : ""}</div>)}
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" />OFF</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#DC2626]" />PTO-1</div>
+              <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#DC2626]" style={{ border: "2px dashed #7C3AED" }} />WKND (off per rotation, not leave)</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#F59E0B]" />PTO-2</div>
               <button
-                onClick={() => downloadScheduleCsv({ schedule, permanent, extra, ptoStatus, holidays, key, shiftLabel }, `schedule_${startDate}_${numWeeks}w.csv`)}
+                onClick={() => downloadScheduleCsv({ schedule, permanent, extra, ptoStatus, ptoSource, holidays, key, shiftLabel }, `schedule_${startDate}_${numWeeks}w.csv`)}
                 className="ml-auto px-3 py-1.5 text-xs font-semibold rounded border border-[#0D9488] text-[#0D9488] hover:bg-[#0D9488] hover:text-white"
               >
                 ⬇ Export CSV
@@ -1880,7 +1961,14 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                             ? <span className="text-[#DC2626] font-semibold" title={`Never worked: ${f.missingShifts.map(shiftLabel).join(", ")}`}>⚠ {f.missingShifts.map(shiftLabel).join(", ")}</span>
                             : <span className="text-[#0D9488]">✓</span>}
                         </td>
-                        {ALL_SHIFT_CODES.map((s) => <td key={s} className={`px-2 py-1.5 border-b border-[#F1F5F9] text-center ${f.missingShifts.includes(s) ? "text-[#DC2626] font-semibold" : ""}`}>{f.perShift[s]}</td>)}
+                        {ALL_SHIFT_CODES.map((s) => {
+                          const trained = f.allowedShifts.includes(s);
+                          return (
+                            <td key={s} title={trained ? undefined : "Not trained on this shift"} className={`px-2 py-1.5 border-b border-[#F1F5F9] text-center ${!trained ? "text-[#CBD5E1] bg-[#F7F8FA]" : f.missingShifts.includes(s) ? "text-[#DC2626] font-semibold" : ""}`}>
+                              {trained ? f.perShift[s] : "—"}
+                            </td>
+                          );
+                        })}
                         <td className="px-3 py-1.5 border-b border-[#F1F5F9]">
                           <div className="flex items-end gap-0.5 h-6">
                             {ALL_SHIFT_CODES.map((s) => <div key={s} title={`${shiftLabel(s)}: ${f.perShift[s]}`} style={{ background: getShiftColor(s), height: `${Math.max((f.perShift[s] / max) * 100, 12)}%`, width: "6px" }} className="rounded-sm" />)}

@@ -86,5 +86,46 @@ export function buildFeasibilityReport({ days, permanent, extra, ptoStatus, extr
     };
   });
 
-  return { overall, weekends, holidays: holidayReport };
+  // --- Per-shift-code breakdown ---
+  // The three totals above are pure headcount — they'd say "fully
+  // staffed" even if every one of those spare people happens to be
+  // untrained for the one shift that's actually short. Every shift code
+  // in weekdayShifts covers every non-weekend day; it ALSO covers
+  // weekends/holidays if it's in weekendShifts too (that's the only
+  // difference between the two lists — see App.jsx).
+  const byShift = weekdayShifts.map((code) => {
+    const runsWeekend = weekendShifts.includes(code);
+    let required = 0;
+    days.forEach((d) => {
+      const isWknd = d.isWeekend || holidays.has(d.iso);
+      if (!isWknd || runsWeekend) required++;
+    });
+    let availablePermanent = 0;
+    permanent.forEach((emp) => {
+      if (!emp.allowedShifts.includes(code)) return;
+      let availableDays = 0;
+      days.forEach((d) => {
+        const isWknd = d.isWeekend || holidays.has(d.iso);
+        if (isWknd && !runsWeekend) return;
+        if (isEligibleForDay(emp, d.dow, ptoStatus[key(emp.id, d.idx)])) availableDays++;
+      });
+      const ceiling = maxShiftsUnderCap(emp.shiftCap, days.length);
+      availablePermanent += Math.min(availableDays, ceiling);
+    });
+    let availablePrn = 0;
+    extra.forEach((emp) => {
+      if (!emp.allowedShifts.includes(code)) return;
+      days.forEach((d) => {
+        const isWknd = d.isWeekend || holidays.has(d.iso);
+        if (isWknd && !runsWeekend) return;
+        if (extraAvailable[key(emp.id, d.idx)]) availablePrn++;
+      });
+    });
+    return {
+      code, required, availablePermanent, availablePrn,
+      shortfall: Math.max(0, required - availablePermanent - availablePrn),
+    };
+  });
+
+  return { overall, weekends, holidays: holidayReport, byShift };
 }
