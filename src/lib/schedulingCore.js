@@ -71,6 +71,29 @@ export function longestConsecutiveRun(dayIndices) {
   }
   return longest;
 }
+// Count "lonely" days off: a day the employee is free (not worked, not
+// PTO-blocked) but both neighbouring calendar days are worked. These are
+// the scattered single days off (Mon off, Tue–Thu on, Fri off) that a
+// grouped-days-off preference wants to eliminate. Days off that already
+// sit next to another day off, or next to the edge of the schedule, don't
+// count — a 2+ day block is exactly what we want.
+export function countLonelyDaysOff(workedDayIndices, freeDayIndices) {
+  const worked = new Set(workedDayIndices);
+  return freeDayIndices.filter((idx) => worked.has(idx - 1) && worked.has(idx + 1)).length;
+}
+// Count "lonely" shifts: a worked day with both neighbouring calendar days
+// off (not worked). The flip side of countLonelyDaysOff — a lone workday
+// between two days off. Days at the very start or end of the schedule
+// don't count, same as lonely days off.
+export function countLonelyShifts(workedDayIndices, totalDays) {
+  const worked = new Set(workedDayIndices);
+  return workedDayIndices.filter((idx) => idx > 0 && idx < totalDays - 1 && !worked.has(idx - 1) && !worked.has(idx + 1)).length;
+}
+// Shift codes on this day that nobody is assigned to. Derived from the
+// assignment itself so it stays correct after the optimizer moves people.
+export function unfilledShifts(day, activeShifts) {
+  return activeShifts.filter((code) => !day.assignment[code]);
+}
 // Hard version of the consecutive-days preference — mirrors
 // wouldExceedShiftCap's shape exactly (existing + proposed days in,
 // boolean out) so it drops into the same call sites.

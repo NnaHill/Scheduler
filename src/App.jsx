@@ -26,9 +26,11 @@ import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
   wouldExceedShiftCap, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
   weekendIndexFor, isOpenWeekend, kuhnMatch, partitionRun,
-  longestConsecutiveRun, wouldExceedConsecutiveDays,
+  longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, unfilledShifts,
 } from "./lib/schedulingCore";
 import { buildFeasibilityReport } from "./lib/feasibility";
+import { buildOptimizationTips } from "./lib/optimizationTips";
+import OptimizationTab from "./OptimizationTab";
 import { downloadScheduleCsv } from "./lib/csvExport";
 import { fetchAllProfiles } from "./lib/auth";
 import AccountSettings from "./AccountSettings";
@@ -74,6 +76,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [startDate, setStartDate] = useState(nextMonday());
   const [maxConsecutiveDays, setMaxConsecutiveDays] = useState(6);
   const [consecutiveHardLimit, setConsecutiveHardLimit] = useState(false);
+  const [groupDaysOff, setGroupDaysOff] = useState(true);
+  const [avoidLonelyShifts, setAvoidLonelyShifts] = useState(true);
   const [employees, setEmployees] = useState([]);
   const [ptoStatus, setPtoStatus] = useState({});
   const [ptoSource, setPtoSource] = useState({}); // key -> 'manual' | 'weekend_rotation'
@@ -713,6 +717,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     return stats;
   };
 
+  // Shifts with nobody on them on a given day. Read from the assignment,
+  // so it's correct after the optimizer has moved people around.
+  const holesOnDay = (day) => unfilledShifts(day, day.isWknd ? weekendShifts : weekdayShifts);
+
   const costOf = (daysArr, totalDaysCount) => {
     const stats = computeStats(daysArr);
     // Capped employees (extended-hour schedules, ~half the normal shift
@@ -761,7 +769,131 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         if (run > maxConsecutiveDays) consecutiveRunPenalty += run - maxConsecutiveDays;
       });
     }
-    return totalSpread * 5 + shiftSpread * 1 + weekendViol * 50 + missingShiftPenalty * 40 + consecutiveRunPenalty * 35;
+    // Scattered single days off (work, off, work) cost a bit each. Zero
+    // when the grouping toggle is off, so the score is unchanged then.
+    let lonelyOffPenalty = 0;
+    if (groupDaysOff) {
+      permanent.forEach((e) => {
+        const worked = stats[e.id].workedDays;
+        const workedSet = new Set(worked);
+        const free = daysArr.filter((d) => !workedSet.has(d.idx) && !ptoStatus[key(e.id, d.idx)]).map((d) => d.idx);
+        lonelyOffPenalty += countLonelyDaysOff(worked, free);
+      });
+    }
+    // Same idea for a lone workday between two days off. Zero when its
+    // toggle is off.
+    let lonelyShiftPenalty = 0;
+    if (avoidLonelyShifts) {
+      permanent.forEach((e) => { lonelyShiftPenalty += countLonelyShifts(stats[e.id].workedDays, daysArr.length); });
+    }
+    // Each empty shift weighs more than any balance or grouping gain, so
+    // the optimizer only gives up shift balance when that fills a gap.
+    const emptyShifts = daysArr.reduce((sum, d) => sum + holesOnDay(d).length, 0);
+    return emptyShifts * 30 + totalSpread * 5 + shiftSpread * 1 + weekendViol * 50 + missingShiftPenalty * 40 + consecutiveRunPenalty * 35 + lonelyOffPenalty * 15 + lonelyShiftPenalty * 15;
+  };
+
+  // Trades one employee's shift with a colleague's shift on a nearby day
+  // (same shift code, same kind of day). Each day keeps the same number of
+  // people on each shift, so coverage can't drop — the only thing that
+  // changes is which days each person works. This is the move that lets the
+  // optimizer line up an employee's days off into one block.
+  const proposeDayTrade = (current, dIdx, entries) => {
+    const [shift, infoX] = entries[Math.floor(Math.random() * entries.length)];
+    const X = current[dIdx];
+    const eId = infoX.empId;
+    const E = permanent.find((p) => p.id === eId);
+    if (!E || !E.allowedShifts.includes(shift) || ptoStatus[key(eId, X.idx)]) return null;
+    const usedOnX = new Set(Object.values(X.assignment).map((v) => v.empId));
+    const candidates = [];
+    for (let jIdx = Math.max(0, dIdx - 3); jIdx <= Math.min(current.length - 1, dIdx + 3); jIdx++) {
+      if (jIdx === dIdx) continue;
+      const Y = current[jIdx];
+      if (Y.isWknd !== X.isWknd) continue;
+      const infoY = Y.assignment[shift];
+      if (!infoY || infoY.type !== "permanent" || infoY.fixed || infoY.override) continue;
+      const F = permanent.find((p) => p.id === infoY.empId);
+      if (!F || usedOnX.has(F.id) || F.id === eId) continue;
+      if (Object.values(Y.assignment).some((v) => v.empId === eId)) continue;
+      if (!F.allowedShifts.includes(shift) || ptoStatus[key(F.id, X.idx)] || ptoStatus[key(eId, Y.idx)]) continue;
+      if (E.fixedDays.includes(Y.dow) || F.fixedDays.includes(X.dow)) continue;
+      candidates.push({ jIdx, Y, infoY, F });
+    }
+    if (candidates.length === 0) return null;
+    const { jIdx, Y, infoY, F } = candidates[Math.floor(Math.random() * candidates.length)];
+    const trialDays = [...current];
+    trialDays[dIdx] = { ...X, assignment: { ...X.assignment, [shift]: { ...infoX, empId: F.id } } };
+    trialDays[jIdx] = { ...Y, assignment: { ...Y.assignment, [shift]: { ...infoY, empId: eId } } };
+    const hardStreak = consecutiveHardLimit ? maxConsecutiveDays : 0;
+    const withinRules = (emp) => {
+      const worked = workedDayIndicesFromSchedule(trialDays, emp.id);
+      return !wouldExceedShiftCap(emp, worked, []) && !wouldExceedConsecutiveDays(worked, [], hardStreak);
+    };
+    if (!withinRules(E) || !withinRules(F)) return null;
+    if (!respectsFixedDayRestriction(E, [Y.dow]) || !respectsFixedDayRestriction(F, [X.dow])) return null;
+    return trialDays;
+  };
+
+  // Fills an empty shift on one day with a trained person who's free that
+  // day, by moving them off a nearby day's shift. A colleague who's free
+  // that nearby day and trained for that shift takes over the old slot, so
+  // no other shift loses coverage. Only accepted if the score improves.
+  const proposeFill = (current) => {
+    const holeDays = current.filter((d) => holesOnDay(d).some((s) => !isContinuityCode(s)));
+    if (holeDays.length === 0) return null;
+    const X = holeDays[Math.floor(Math.random() * holeDays.length)];
+    const xIdx = current.indexOf(X);
+    const fillable = holesOnDay(X).filter((s) => !isContinuityCode(s));
+    const H = fillable[Math.floor(Math.random() * fillable.length)];
+    const usedOnX = new Set(Object.values(X.assignment).map((v) => v.empId));
+    const hardStreak = consecutiveHardLimit ? maxConsecutiveDays : 0;
+    const withinRules = (trialDays, emp) => {
+      const worked = workedDayIndicesFromSchedule(trialDays, emp.id);
+      return !wouldExceedShiftCap(emp, worked, []) && !wouldExceedConsecutiveDays(worked, [], hardStreak);
+    };
+    // First choice: someone already free that day and trained for the
+    // empty shift — just add them, nobody else has to move.
+    const free = permanent.filter((p) => !usedOnX.has(p.id) && p.allowedShifts.includes(H)
+      && !ptoStatus[key(p.id, X.idx)] && !p.fixedDays.includes(X.dow) && respectsFixedDayRestriction(p, [X.dow]));
+    for (let k = free.length - 1; k > 0; k--) {
+      const m = Math.floor(Math.random() * (k + 1));
+      [free[k], free[m]] = [free[m], free[k]];
+    }
+    for (const P of free) {
+      const trialDays = [...current];
+      trialDays[xIdx] = { ...X, assignment: { ...X.assignment, [H]: { empId: P.id, type: "permanent", override: false, fixed: false } } };
+      if (withinRules(trialDays, P)) return trialDays;
+    }
+    // Second choice: move someone off a nearby day, and have a colleague
+    // take over that slot.
+    const candidates = [];
+    for (let j = Math.max(0, xIdx - 3); j <= Math.min(current.length - 1, xIdx + 3); j++) {
+      if (j === xIdx || current[j].isWknd !== X.isWknd) continue;
+      Object.entries(current[j].assignment).forEach(([S, infoY]) => {
+        if (infoY.type === "permanent" && !infoY.fixed && !infoY.override && !isContinuityCode(S)) candidates.push({ j, S, infoY });
+      });
+    }
+    for (let k = candidates.length - 1; k > 0; k--) {
+      const m = Math.floor(Math.random() * (k + 1));
+      [candidates[k], candidates[m]] = [candidates[m], candidates[k]];
+    }
+    for (const { j, S, infoY } of candidates) {
+      const Y = current[j];
+      const P = permanent.find((p) => p.id === infoY.empId);
+      if (!P || usedOnX.has(P.id) || !P.allowedShifts.includes(H) || ptoStatus[key(P.id, X.idx)]) continue;
+      if (P.fixedDays.includes(X.dow) || !respectsFixedDayRestriction(P, [X.dow])) continue;
+      const replacements = permanent.filter((q) => q.id !== P.id && q.allowedShifts.includes(S)
+        && !ptoStatus[key(q.id, Y.idx)] && !q.fixedDays.includes(Y.dow)
+        && !Object.values(Y.assignment).some((v) => v.empId === q.id));
+      if (replacements.length === 0) continue;
+      const Q = replacements[Math.floor(Math.random() * replacements.length)];
+      const trialDays = [...current];
+      trialDays[xIdx] = { ...X, assignment: { ...X.assignment, [H]: { empId: P.id, type: "permanent", override: false, fixed: false } } };
+      trialDays[j] = { ...Y, assignment: { ...Y.assignment, [S]: { empId: Q.id, type: "permanent", override: false, fixed: false } } };
+      if (!withinRules(trialDays, P) || !withinRules(trialDays, Q)) continue;
+      if (!respectsFixedDayRestriction(Q, [Y.dow])) continue;
+      return trialDays;
+    }
+    return null;
   };
 
   const localSearch = (initialDays, iterations = 2500) => {
@@ -771,7 +903,25 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const dIdx = Math.floor(Math.random() * current.length);
       const day = current[dIdx];
       const entries = Object.entries(day.assignment).filter(([shift, info]) => info.type === "permanent" && !info.fixed && !info.override && !isContinuityCode(shift));
-      const moveType = Math.random() < 0.5 ? "A" : "B";
+      const r = Math.random();
+      const shapingOn = groupDaysOff || avoidLonelyShifts;
+      const anyEmpty = current.some((d) => holesOnDay(d).some((s) => !isContinuityCode(s)));
+      const moveType = anyEmpty && r < 0.2 ? "D" : shapingOn ? (r < 0.5 ? "A" : r < 0.75 ? "B" : "C") : (r < 0.6 ? "A" : "B");
+      if (moveType === "D") {
+        const trialDays = proposeFill(current);
+        if (!trialDays) continue;
+        const trialCost = costOf(trialDays, current.length);
+        if (trialCost <= currentCost) { current = trialDays; currentCost = trialCost; }
+        continue;
+      }
+      if (moveType === "C") {
+        if (entries.length === 0) continue;
+        const trialDays = proposeDayTrade(current, dIdx, entries);
+        if (!trialDays) continue;
+        const trialCost = costOf(trialDays, current.length);
+        if (trialCost <= currentCost) { current = trialDays; currentCost = trialCost; }
+        continue;
+      }
       let trialAssignment = { ...day.assignment };
       let mutated = false;
 
@@ -922,7 +1072,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       });
 
       const costBefore = costOf(initialDays, initialDays.length);
-      const { days: optimizedDays, finalCost: costAfter } = localSearch(initialDays, 2500);
+      const { days: searchedDays, finalCost: costAfter } = localSearch(initialDays, 2500);
+      const optimizedDays = searchedDays.map((d) => ({ ...d, holes: holesOnDay(d) }));
 
       let totalHoles = 0, totalOverrides = 0;
       optimizedDays.forEach((d) => {
@@ -947,7 +1098,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         const missingShifts = hasAvailability ? weekdayShifts.filter((s) => e.allowedShifts.includes(s) && st.shiftCount[s] === 0) : [];
         const longestRun = longestConsecutiveRun(st.workedDays);
         const longestRunExceeded = maxConsecutiveDays > 0 && longestRun > maxConsecutiveDays;
-        return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, allowedShifts: e.allowedShifts, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded };
+        const workedSet = new Set(st.workedDays);
+        const freeIdx = optimizedDays.filter((d) => !workedSet.has(d.idx) && !ptoStatus[key(e.id, d.idx)]).map((d) => d.idx);
+        const lonelyDaysOff = countLonelyDaysOff(st.workedDays, freeIdx);
+        const lonelyShifts = countLonelyShifts(st.workedDays, optimizedDays.length);
+        return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, allowedShifts: e.allowedShifts, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded, lonelyDaysOff, lonelyShifts };
       });
       const extraFairness = extra.map((e) => {
         const total = optimizedDays.reduce((sum, d) => sum + Object.values(d.assignment).filter((a) => a.empId === e.id && a.type === "extra").length, 0);
@@ -959,7 +1114,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const shiftCapViolations = verifyShiftCaps(optimizedDays);
       const cappedFixedDayViolations = verifyCappedFixedDays(optimizedDays);
 
-      const scheduleSnapshot = { days: optimizedDays, fairness, extraFairness, totalHoles, totalOverrides, costBefore, costAfter, iterations: 2500, continuityCheck, employeesMissingShifts, shiftCapViolations, cappedFixedDayViolations, numWeeks, startDate };
+      const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts };
+      const scheduleSnapshot = { settingsUsed, days: optimizedDays, fairness, extraFairness, totalHoles, totalOverrides, costBefore, costAfter, iterations: 2500, continuityCheck, employeesMissingShifts, shiftCapViolations, cappedFixedDayViolations, numWeeks, startDate };
       setSchedule(scheduleSnapshot);
       saveScheduleSnapshot(scheduleSnapshot, viewingOwnerId).catch(reportSyncError);
       setGenerating(false);
@@ -981,6 +1137,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     else if (totalSpread > 1 || maxShiftSpread > 1) { label = "Good balance"; tone = "#CA8A04"; }
     return { totalSpread, maxShiftSpread, label, tone };
   }, [schedule]);
+
+  const optimizationTips = useMemo(() => (schedule ? buildOptimizationTips({
+    schedule, feasibility, employees, ptoStatus, shiftLabel,
+    settings: schedule.settingsUsed,
+  }) : []), [schedule, feasibility, employees, ptoStatus]);
 
   const cellFor = (employee, day) => {
     const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
@@ -1115,10 +1276,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         </header>
 
         <div className="flex gap-2 mb-6 border-b border-[#E4E7EC] flex-wrap print-hide">
-          {["instructions", "setup", "permanent", "extra", "schedule", "fairness"].map((t) => (
+          {["instructions", "setup", "permanent", "extra", "schedule", "fairness", "optimization"].map((t) => (
             <button key={t} onClick={() => (t === "instructions" || t === "setup" || t === "permanent" || t === "extra" || schedule) && setTab(t)}
-              className={`px-3 py-2 text-sm font-medium capitalize border-b-2 transition-colors ${tab === t ? "border-[#0D9488] text-[#0D9488]" : "border-transparent text-[#64748B] hover:text-[#1A2233]"} ${(t === "schedule" || t === "fairness") && !schedule ? "opacity-40 cursor-not-allowed" : "cursor-pointer"}`}>
-              {{ instructions: "1. Instructions", setup: "2. Setup", permanent: "3. Permanent Staff", extra: "4. PRN Staff", schedule: "5. Schedule", fairness: "6. Fairness Report" }[t]}
+              className={`px-3 py-2 text-sm font-medium capitalize border-b-2 transition-colors ${tab === t ? "border-[#0D9488] text-[#0D9488]" : "border-transparent text-[#64748B] hover:text-[#1A2233]"} ${(t === "schedule" || t === "fairness" || t === "optimization") && !schedule ? "opacity-40 cursor-not-allowed" : "cursor-pointer"}`}>
+              {{ instructions: "1. Instructions", setup: "2. Setup", permanent: "3. Permanent Staff", extra: "4. PRN Staff", schedule: "5. Schedule", fairness: "6. Fairness Report", optimization: "7. Optimization" }[t]}
             </button>
           ))}
         </div>
@@ -1144,7 +1305,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
             </div>
 
             <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
-              <div className="text-sm font-semibold mb-1">The 6 tabs, in order</div>
+              <div className="text-sm font-semibold mb-1">The 7 tabs, in order</div>
               <p className="text-xs text-[#64748B] mb-3">Work through these top to bottom the first time. After that, you'll mostly live in Setup and Schedule.</p>
 
               <div className="border-t border-[#F1F5F9] pt-3">
@@ -1243,6 +1404,14 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 <p className="text-xs text-[#33405A] mb-2">Covered in detail further down this page.</p>
                 <img src="/instructions/fairness-summary.png" alt="Overall balance summary banner at the top of the Fairness Report" className="w-full rounded border border-[#E4E7EC]" />
               </div>
+
+              <div className="border-t border-[#F1F5F9] pt-3 mt-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="w-6 h-6 rounded-full bg-[#E6F6F4] text-[#0B6B62] text-xs font-bold flex items-center justify-center">7</span>
+                  <h3 className="text-sm font-semibold">Optimization — what to fix next</h3>
+                </div>
+                <p className="text-xs text-[#33405A] mb-2">Plain-English fixes for the schedule you just generated: unfilled shifts, too many days in a row, scattered days off. Each card tells you which tab and field to change, and you can tick it off once done.</p>
+              </div>
             </div>
 
             <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
@@ -1322,6 +1491,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   ["Weekends ⚠", "How many weekend/holiday shifts they worked. The ⚠ means they went over 4 weeks without one — an uneven gap."],
                   ["Longest streak ⚠", "Their longest run of consecutive working days. The ⚠ means it went over your Max consecutive days setting."],
                   ["Missing shifts ⚠", "Shift types they never got assigned at all this rotation, even once."],
+                  ["Lonely days off", "Single days off with work on both sides (work, off, work). Fewer is better — a 2+ day block off counts as a proper break and isn't included."],
+                  ["Lonely shifts", "Single workdays with days off on both sides (off, work, off). Fewer is better — a shift next to another shift isn't counted."],
                   ["Per-shift columns", "How many times they worked each specific shift — use this to spot someone stuck doing the same one repeatedly."],
                   ["Distribution", "A tiny bar chart of their shift mix at a glance — evenly spread bars = a well-balanced schedule for that person."],
                 ].map(([term, def]) => (
@@ -1364,6 +1535,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                     Hard limit
                   </label>
                 </div>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#64748B] mb-1">Days off</label>
+                <label className="flex items-center gap-1 text-[11px] text-[#64748B] cursor-pointer" title="Tries to group each person's days off into blocks of 2+ instead of single days scattered across the week. A preference, not a hard rule.">
+                  <input type="checkbox" checked={groupDaysOff} onChange={(e) => setGroupDaysOff(e.target.checked)} />
+                  Group days off together
+                </label>
+                <label className="flex items-center gap-1 text-[11px] text-[#64748B] cursor-pointer" title="Tries to avoid single workdays with days off on both sides. A preference, not a hard rule.">
+                  <input type="checkbox" checked={avoidLonelyShifts} onChange={(e) => setAvoidLonelyShifts(e.target.checked)} />
+                  Avoid lonely shifts
+                </label>
               </div>
               <div className="flex-1" />
               {permanent.length === 0 && (
@@ -1886,6 +2068,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
           </div>
         )}
 
+        {tab === "optimization" && schedule && (
+          <OptimizationTab tips={optimizationTips} />
+        )}
+
         {tab === "fairness" && schedule && (
           <div className="space-y-4">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -1936,6 +2122,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                     <th className="px-2 py-2 border-b border-[#E4E7EC]">PTO-2 *</th>
                     <th className="px-2 py-2 border-b border-[#E4E7EC]">Weekends</th>
                     <th className="px-2 py-2 border-b border-[#E4E7EC]">Longest streak</th>
+                    <th className="px-2 py-2 border-b border-[#E4E7EC]" title="Single days off with work on both sides — a 2+ day block off is not counted">Lonely days off</th>
+                    <th className="px-2 py-2 border-b border-[#E4E7EC]" title="Single workdays with days off on both sides">Lonely shifts</th>
                     <th className="px-2 py-2 border-b border-[#E4E7EC]">Missing shifts</th>
                     {ALL_SHIFT_CODES.map((s) => <th key={s} className="px-2 py-2 border-b border-[#E4E7EC]" title={s}>{shiftLabel(s)}</th>)}
                     <th className="px-3 py-2 border-b border-[#E4E7EC] text-left">Distribution</th>
@@ -1956,6 +2144,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                         <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center text-[#CA8A04]">{f.pto2Overridden}</td>
                         <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">{f.weekendCount}{f.weekendRuleBroken && <span title="Gap exceeded 4 weeks" className="text-[#DC2626] ml-1">⚠</span>}</td>
                         <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">{f.longestRun} day{f.longestRun === 1 ? "" : "s"}{f.longestRunExceeded && <span title={`Worked ${f.longestRun} days in a row — over your ${maxConsecutiveDays}-day preference`} className="text-[#DC2626] ml-1">⚠</span>}</td>
+                        <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">{f.lonelyDaysOff}</td>
+                        <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">{f.lonelyShifts}</td>
                         <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">
                           {f.missingShifts.length > 0
                             ? <span className="text-[#DC2626] font-semibold" title={`Never worked: ${f.missingShifts.map(shiftLabel).join(", ")}`}>⚠ {f.missingShifts.map(shiftLabel).join(", ")}</span>

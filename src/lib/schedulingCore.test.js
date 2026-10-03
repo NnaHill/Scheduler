@@ -9,6 +9,9 @@ import {
   wouldExceedShiftCap,
   longestConsecutiveRun,
   wouldExceedConsecutiveDays,
+  countLonelyDaysOff,
+  countLonelyShifts,
+  unfilledShifts,
   maxShiftsUnderCap,
   workedDayIndicesFromSchedule,
   respectsFixedDayRestriction,
@@ -138,6 +141,50 @@ describe("wouldExceedConsecutiveDays", () => {
   });
   test("a proposed day that doesn't connect to the existing run is fine", () => {
     expect(wouldExceedConsecutiveDays([0, 1, 2, 3, 4], [20], 6)).toBe(false);
+  });
+});
+
+describe("countLonelyDaysOff", () => {
+  test("a single free day between two worked days is lonely", () => {
+    expect(countLonelyDaysOff([0, 2], [1])).toBe(1);
+  });
+  test("a free block of two or more is not lonely", () => {
+    expect(countLonelyDaysOff([0, 3], [1, 2])).toBe(0);
+  });
+  test("a free day at the edge of the schedule is not lonely", () => {
+    expect(countLonelyDaysOff([1], [0])).toBe(0);
+  });
+  test("alternating work and off days makes every off day lonely", () => {
+    expect(countLonelyDaysOff([0, 2, 4, 6], [1, 3, 5])).toBe(3);
+  });
+  test("grouped off days (5 on, 2 off) produce no lonely days", () => {
+    expect(countLonelyDaysOff([0, 1, 2, 3, 4, 7, 8, 9, 10, 11], [5, 6, 12, 13])).toBe(0);
+  });
+});
+
+describe("countLonelyShifts", () => {
+  test("a lone workday between two days off is lonely", () => {
+    expect(countLonelyShifts([2], 5)).toBe(1);
+  });
+  test("a workday next to another workday is not lonely", () => {
+    expect(countLonelyShifts([2, 3], 6)).toBe(0);
+  });
+  test("a workday at the start or end of the schedule is not lonely", () => {
+    expect(countLonelyShifts([0, 4], 5)).toBe(0);
+  });
+  test("alternating work and off makes every workday lonely", () => {
+    expect(countLonelyShifts([1, 3, 5], 7)).toBe(3);
+  });
+});
+
+describe("unfilledShifts", () => {
+  test("lists active shifts with nobody assigned", () => {
+    const day = { assignment: { E1: { empId: 1 }, E3: { empId: 2 } } };
+    expect(unfilledShifts(day, ["E1", "E2", "E3"])).toEqual(["E2"]);
+  });
+  test("a fully staffed day has no unfilled shifts", () => {
+    const day = { assignment: { E1: { empId: 1 } } };
+    expect(unfilledShifts(day, ["E1"])).toEqual([]);
   });
 });
 
