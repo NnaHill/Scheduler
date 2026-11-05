@@ -194,6 +194,24 @@ export function buildOptimizationTips({ schedule, feasibility, employees, ptoSta
     });
   }
 
+  // 7. Weekends where Saturday and Sunday ended up with different people
+  // on the same shift — the pairing pre-pass tries for the same person
+  // both days; this is the approved best-effort fallback, not a bug.
+  const pairingMisses = schedule.weekendPairingMismatches || [];
+  if (pairingMisses.length > 0) {
+    tips.push({
+      id: "weekend-pairing",
+      level: "tip",
+      impact: { count: 0, text: "Doesn't fill empty shifts — it's about weekend consistency" },
+      title: `${pairingMisses.length} weekend${pairingMisses.length === 1 ? "" : "s"} had different people on Saturday vs Sunday`,
+      summary: pairingMisses.slice(0, MAX_LISTED).join(" · "),
+      steps: [
+        { where: "3. Permanent Staff", change: "Nobody permanent was free both days for that shift — check PTO, shift caps, and fixed days around that weekend." },
+        { where: "4. PRN Staff", change: "A trained backup covering one of the two days is expected and not a problem — PRN is exempt from pairing by design." },
+      ],
+    });
+  }
+
   if (tips.length === 0) {
     return [{ id: "ok", level: "ok", impact: { count: 0, text: "" }, title: "Nothing to fix — this schedule looks good", summary: "No unfilled shifts, streak problems, scattered days off, or rule violations.", steps: [] }];
   }

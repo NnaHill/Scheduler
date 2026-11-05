@@ -17,6 +17,10 @@ const employeeFromRow = (r) => ({
   allowedShifts: r.allowed_shifts || [],
   shiftCap: r.shift_cap || null,
   weekendRotation: r.weekend_rotation || null,
+  // PRN only — which days of the week they're generally available. Used
+  // just to bulk-fill the day-by-day availability grid; the scheduler
+  // itself still only reads that grid, not this pattern.
+  availableDaysOfWeek: r.available_days_of_week || [],
 });
 const employeeToRow = (e, ownerId) => ({
   id: e.id,
@@ -26,6 +30,7 @@ const employeeToRow = (e, ownerId) => ({
   allowed_shifts: e.allowedShifts,
   shift_cap: e.shiftCap || null,
   weekend_rotation: e.weekendRotation || null,
+  available_days_of_week: e.availableDaysOfWeek || [],
   owner_id: ownerId,
 });
 
@@ -200,6 +205,24 @@ export async function removeExtraAvailabilityRow(employeeId, iso, ownerId) {
     .eq("employee_id", employeeId)
     .eq("owner_id", ownerId)
     .eq("day_iso", iso);
+  if (error) throw error;
+}
+// Bulk versions — used by "Apply availability pattern" (fills many days
+// at once from a PRN employee's weekly pattern) and its range-scoped
+// "Clear" button, same shape as bulkUpsertPtoStatus/bulkDeletePtoStatus.
+export async function bulkUpsertExtraAvailability(rows) {
+  if (rows.length === 0) return;
+  const { error } = await supabase.from("extra_availability").upsert(rows, { onConflict: "employee_id,day_iso" });
+  if (error) throw error;
+}
+export async function bulkDeleteExtraAvailability(employeeId, startIso, endIso, ownerId) {
+  const { error } = await supabase
+    .from("extra_availability")
+    .delete()
+    .eq("employee_id", employeeId)
+    .eq("owner_id", ownerId)
+    .gte("day_iso", startIso)
+    .lte("day_iso", endIso);
   if (error) throw error;
 }
 

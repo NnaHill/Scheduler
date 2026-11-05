@@ -113,4 +113,18 @@ describe("buildOptimizationTips", () => {
     const tip = buildOptimizationTips(s).find((t) => t.id === "violations");
     expect(tip.level).toBe("fix");
   });
+
+  test("weekend pairing mismatches are surfaced as a tip, not a fix", () => {
+    const s = base();
+    s.schedule.weekendPairingMismatches = ["COV1 on Sat 10/10–Sun 10/11: Ann worked Saturday, Bo worked Sunday"];
+    const tip = buildOptimizationTips(s).find((t) => t.id === "weekend-pairing");
+    expect(tip).toBeDefined();
+    expect(tip.level).toBe("tip");
+    expect(tip.impact.count).toBe(0);
+  });
+
+  test("no pairing tip when there are no mismatches", () => {
+    const s = base();
+    expect(buildOptimizationTips(s).some((t) => t.id === "weekend-pairing")).toBe(false);
+  });
 });
