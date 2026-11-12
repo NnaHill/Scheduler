@@ -27,7 +27,7 @@ import {
 import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
   wouldExceedShiftCap, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
-  weekendIndexFor, isOpenWeekend, kuhnMatch, partitionRun,
+  weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, kuhnMatch, partitionRun,
   longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, unfilledShifts,
 } from "./lib/schedulingCore";
 import { buildFeasibilityReport } from "./lib/feasibility";
@@ -164,6 +164,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       return { idx, date, iso: toLocalISO(date), ...fmtLabel(date), isWeekend: dow === 0 || dow === 6, dow };
     });
   }, [numWeeks, startDate]);
+
+  // Weekend index 0 for this schedule = its own first Saturday, so "group
+  // 1 of N" always lands on the first weekend currently in view, no
+  // matter what start date is picked.
+  const weekendEpoch = useMemo(() => scheduleWeekendEpoch(days), [days]);
 
   // PTO and extra-staff availability are persisted keyed by absolute
   // ISO date, independent of rotation length/start date. Re-derive the
@@ -355,7 +360,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         // bother writing a block that changes nothing but clutters the
         // grid; treat it the same as "open" so it's skipped/cleaned up.
         const structurallyExcluded = !respectsFixedDayRestriction(emp, [d.dow]);
-        const wIdx = weekendIndexFor(d.date);
+        const wIdx = weekendIndexFor(d.date, weekendEpoch);
         const shouldBeOpen = isFixedDay || structurallyExcluded || isOpenWeekend(emp.weekendRotation, wIdx);
         const k = key(emp.id, d.idx);
         const currentStatus = ptoStatus[k];
@@ -695,7 +700,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         // Tier 1: a capped employee whose rotation says this is their open
         // weekend. Tier 2: anyone else — an ordinary permanent employee
         // who simply wins this weekend still gets the SAME shift both days.
-        const rotationCandidates = trained.filter((e) => e.shiftCap && isOpenWeekend(e.weekendRotation, weekendIndexFor(sat.date)));
+        const rotationCandidates = trained.filter((e) => e.shiftCap && isOpenWeekend(e.weekendRotation, weekendIndexFor(sat.date, weekendEpoch)));
         const pool = rotationCandidates.length ? rotationCandidates : trained;
         if (!pool.length) return;
         pool.sort((a, b) => stat[a.id] - stat[b.id] || Math.random() - 0.5);

@@ -18,6 +18,7 @@ import {
   isEligibleForDay,
   WEEKEND_EPOCH,
   weekendIndexFor,
+  scheduleWeekendEpoch,
   isOpenWeekend,
   kuhnMatch,
   partitionRun,
@@ -266,6 +267,26 @@ describe("weekendIndexFor / saturdayOfWeekend", () => {
   test("each following Saturday increments the index by one", () => {
     expect(weekendIndexFor(new Date("2024-01-13T00:00:00"))).toBe(1);
     expect(weekendIndexFor(new Date("2024-01-20T00:00:00"))).toBe(2);
+  });
+  test("an explicit epoch overrides the default", () => {
+    const epoch = new Date("2026-12-05T00:00:00"); // a Saturday
+    expect(weekendIndexFor(epoch, epoch)).toBe(0);
+    expect(weekendIndexFor(new Date("2026-12-12T00:00:00"), epoch)).toBe(1);
+  });
+});
+
+describe("scheduleWeekendEpoch", () => {
+  test("picks the first Saturday in the days array, regardless of start date", () => {
+    // A schedule starting on a Monday: Sat is 5 days in.
+    const days = Array.from({ length: 14 }, (_, idx) => {
+      const date = new Date("2026-11-16T00:00:00");
+      date.setDate(date.getDate() + idx);
+      return { idx, date, dow: date.getDay() };
+    });
+    const epoch = scheduleWeekendEpoch(days);
+    expect(epoch.toISOString().slice(0, 10)).toBe("2026-11-21");
+    // So that same Saturday is weekend index 0 for this schedule.
+    expect(weekendIndexFor(epoch, epoch)).toBe(0);
   });
 });
 

@@ -141,23 +141,30 @@ export function isEligibleForDay(emp, dow, ptoStatusForDay) {
   return respectsFixedDayRestriction(emp, [dow]);
 }
 
-// Weekend rotation: a fixed calendar epoch (an actual Saturday) numbers
-// every weekend in the world sequentially, so "weekend index" is stable
-// no matter what rotation start date or length is currently in view —
-// changing the visible window never reshuffles which weekends are whose
-// turn. `emp.weekendRotation` is { cycleWeekends, openOffset } (the one
-// weekend at `openOffset` within every `cycleWeekends`-weekend block is
-// theirs to work; the rest are auto-blocked) or null to opt out of the
-// rotation entirely (works every weekend, never auto-blocked).
-export const WEEKEND_EPOCH = new Date("2024-01-06T00:00:00"); // a Saturday
+// Weekend rotation: weekends are numbered sequentially starting from the
+// first weekend of the CURRENT schedule (see scheduleWeekendEpoch below),
+// so "group 1 of N" always lines up with the first weekend of whatever
+// period is currently being scheduled. `emp.weekendRotation` is
+// { cycleWeekends, openOffset } (the one weekend at `openOffset` within
+// every `cycleWeekends`-weekend block is theirs to work; the rest are
+// auto-blocked) or null to opt out of the rotation entirely (works every
+// weekend, never auto-blocked).
+export const WEEKEND_EPOCH = new Date("2024-01-06T00:00:00"); // a Saturday — fallback epoch, mainly for tests
 export function saturdayOfWeekend(date) {
   const d = new Date(date);
   if (d.getDay() === 0) d.setDate(d.getDate() - 1); // Sunday -> its Saturday
   return d;
 }
-export function weekendIndexFor(date) {
+// The Saturday of the first weekend inside `days` — this is weekend index
+// 0 for the schedule currently being generated. Falls back to the first
+// day if the window somehow contains no Saturday (e.g. a 1-day window).
+export function scheduleWeekendEpoch(days) {
+  const sat = days.find((d) => d.dow === 6);
+  return sat ? sat.date : (days[0] ? days[0].date : WEEKEND_EPOCH);
+}
+export function weekendIndexFor(date, epoch = WEEKEND_EPOCH) {
   const sat = saturdayOfWeekend(date);
-  const diffDays = Math.round((sat - WEEKEND_EPOCH) / 86400000);
+  const diffDays = Math.round((sat - epoch) / 86400000);
   return Math.floor(diffDays / 7);
 }
 export function isOpenWeekend(rotation, weekendIndex) {

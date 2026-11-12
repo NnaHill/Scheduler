@@ -11,9 +11,10 @@
 // shift-code-specific qualification gaps for PRN staff can still produce
 // holes that only show up when you actually generate.
 
-import { key, isEligibleForDay, maxShiftsUnderCap, weekendIndexFor } from "./schedulingCore";
+import { key, isEligibleForDay, maxShiftsUnderCap, weekendIndexFor, scheduleWeekendEpoch } from "./schedulingCore";
 
 export function buildFeasibilityReport({ days, permanent, extra, ptoStatus, extraAvailable, weekdayShifts, weekendShifts, holidays }) {
+  const weekendEpoch = scheduleWeekendEpoch(days);
   // --- Overall aggregate: total shift-slots needed vs total capacity ---
   let requiredSlots = 0;
   days.forEach((d) => {
@@ -62,7 +63,7 @@ export function buildFeasibilityReport({ days, permanent, extra, ptoStatus, extr
     });
     const required = weekendShifts.length;
     weekends.push({
-      weekendIndex: weekendIndexFor(sat.date),
+      weekendIndex: weekendIndexFor(sat.date, weekendEpoch),
       satIso: sat.iso, sunIso: sun.iso,
       satLabel: `${sat.wd} ${sat.md}`, sunLabel: `${sun.wd} ${sun.md}`,
       required, availablePermanent,
