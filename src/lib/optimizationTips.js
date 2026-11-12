@@ -2,6 +2,8 @@
 // fixes. Pure: everything comes in as arguments, so the rules are easy to
 // test and easy to extend — add a new check as one more block below.
 
+import { countBackToBackSameShift } from "./schedulingCore";
+
 const MAX_LISTED = 3;
 
 function dayLabel(d) {
@@ -13,7 +15,7 @@ function listDays(days, max = 4) {
   return days.length > max ? `${shown} +${days.length - max} more` : shown;
 }
 
-export function buildOptimizationTips({ schedule, feasibility, employees, ptoStatus, shiftLabel, settings }) {
+export function buildOptimizationTips({ schedule, feasibility, employees, ptoStatus, shiftLabel, settings, continuityCodes = [] }) {
   const tips = [];
   const label = (code) => shiftLabel(code);
   const rows = schedule.fairness || [];
@@ -208,6 +210,34 @@ export function buildOptimizationTips({ schedule, feasibility, employees, ptoSta
       steps: [
         { where: "3. Permanent Staff", change: "Nobody permanent was free both days for that shift — check PTO, shift caps, and fixed days around that weekend." },
         { where: "4. PRN Staff", change: "A trained backup covering one of the two days is expected and not a problem — PRN is exempt from pairing by design." },
+      ],
+    });
+  }
+
+  // 8. Same shift two days running — the optimizer actively avoids this
+  // (except a Saturday->Sunday pair or a continuity-tagged shift), but on
+  // a tight day it can still happen as a last resort.
+  const isContinuityCode = (code) => continuityCodes.includes(code);
+  const backToBack = [];
+  (employees || []).filter((e) => e.type === "permanent").forEach((e) => {
+    const dayEntries = schedule.days.map((d) => ({
+      dow: d.dow,
+      code: Object.entries(d.assignment).find(([, info]) => info.empId === e.id)?.[0],
+    }));
+    const count = countBackToBackSameShift(dayEntries, isContinuityCode);
+    if (count > 0) backToBack.push({ name: e.name, count });
+  });
+  if (backToBack.length > 0) {
+    const total = backToBack.reduce((sum, r) => sum + r.count, 0);
+    tips.push({
+      id: "back-to-back",
+      level: "tip",
+      impact: { count: 0, text: "Doesn't fill empty shifts — it's about shift variety" },
+      title: `${total} time${total === 1 ? "" : "s"} someone worked the same shift two days in a row`,
+      summary: backToBack.slice(0, MAX_LISTED).map((r) => `${r.name}: ${r.count} time${r.count === 1 ? "" : "s"}`).join(" · "),
+      steps: [
+        { where: "5. Schedule", change: "Click Regenerate — this is a strong preference, not a hard rule, so a different pass may avoid it." },
+        { where: "3. Permanent Staff", change: "If it keeps happening to the same person, check whether they're trained on few enough shifts that repeats are hard to avoid." },
       ],
     });
   }

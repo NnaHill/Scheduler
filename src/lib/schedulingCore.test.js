@@ -11,6 +11,7 @@ import {
   wouldExceedConsecutiveDays,
   countLonelyDaysOff,
   countLonelyShifts,
+  countBackToBackSameShift,
   unfilledShifts,
   maxShiftsUnderCap,
   workedDayIndicesFromSchedule,
@@ -175,6 +176,40 @@ describe("countLonelyShifts", () => {
   });
   test("alternating work and off makes every workday lonely", () => {
     expect(countLonelyShifts([1, 3, 5], 7)).toBe(3);
+  });
+});
+
+describe("countBackToBackSameShift", () => {
+  const dow = (idx) => idx % 7; // schedule starting on a Sunday for easy math: idx 6/7 = Sat/Sun
+  const day = (idx, code) => ({ dow: dow(idx), code });
+
+  test("the same code two weekdays running counts once", () => {
+    const entries = [day(1, "E1"), day(2, "E1"), day(3, "E2")];
+    expect(countBackToBackSameShift(entries, () => false)).toBe(1);
+  });
+  test("three in a row counts two adjacent pairs", () => {
+    const entries = [day(1, "E1"), day(2, "E1"), day(3, "E1")];
+    expect(countBackToBackSameShift(entries, () => false)).toBe(2);
+  });
+  test("different codes on consecutive days don't count", () => {
+    const entries = [day(1, "E1"), day(2, "E2")];
+    expect(countBackToBackSameShift(entries, () => false)).toBe(0);
+  });
+  test("an off day in between breaks the adjacency", () => {
+    const entries = [day(1, "E1"), day(2, null), day(3, "E1")];
+    expect(countBackToBackSameShift(entries, () => false)).toBe(0);
+  });
+  test("a Saturday->Sunday repeat is exempt (weekend pairing)", () => {
+    const entries = [day(6, "E1"), day(7, "E1")]; // dow 6 = Sat, dow 0 (7%7) = Sun
+    expect(countBackToBackSameShift(entries, () => false)).toBe(0);
+  });
+  test("a Sunday->Monday repeat is NOT exempt", () => {
+    const entries = [day(7, "E1"), day(8, "E1")]; // dow 0 = Sun, dow 1 = Mon
+    expect(countBackToBackSameShift(entries, () => false)).toBe(1);
+  });
+  test("a continuity-tagged code is exempt even on weekdays", () => {
+    const entries = [day(1, "CONT"), day(2, "CONT")];
+    expect(countBackToBackSameShift(entries, (code) => code === "CONT")).toBe(0);
   });
 });
 

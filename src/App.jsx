@@ -28,7 +28,7 @@ import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
   wouldExceedShiftCap, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
   weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, kuhnMatch, partitionRun,
-  longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, unfilledShifts,
+  longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, countBackToBackSameShift, unfilledShifts,
 } from "./lib/schedulingCore";
 import { buildFeasibilityReport } from "./lib/feasibility";
 import { buildOptimizationTips } from "./lib/optimizationTips";
@@ -717,10 +717,21 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     return { dayAssignment, workedDaysByEmp };
   };
 
-  const assignDay = (day, stats, extraStats, preAssigned = {}, capWorkedDays, extraCapWorkedDays) => {
+  const assignDay = (day, stats, extraStats, preAssigned = {}, capWorkedDays, extraCapWorkedDays, prevShiftByEmp = {}) => {
     const isWknd = day.isWeekend || holidays.has(day.iso);
     const activeShifts = isWknd ? weekendShifts : weekdayShifts;
     const statusOf = (id) => ptoStatus[key(id, day.idx)];
+    // Strongly discourage (but don't forbid — the pool's eligibility isn't
+    // touched) handing someone the identical shift they worked yesterday.
+    // Same two exceptions as everywhere else this rule applies: a
+    // Saturday->Sunday pair, and a continuity-tagged shift.
+    const repeatsPrevShift = (id, shift) => {
+      const prev = prevShiftByEmp[id];
+      if (!prev || prev.dayIdx !== day.idx - 1 || prev.shift !== shift) return false;
+      if (isContinuityCode(shift)) return false;
+      if (prev.dow === 6 && day.dow === 0) return false;
+      return true;
+    };
     const assignment = { ...preAssigned };
     const usedIds = new Set(Object.values(preAssigned).map((e) => e.empId));
     let remaining = activeShifts.filter((s) => !(s in preAssigned) && !isContinuityCode(s));
@@ -749,15 +760,16 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const underStreak = (e) => !wouldExceedConsecutiveDays(capWorkedDays[e.id], [day.idx], consecutiveHardLimit ? maxConsecutiveDays : 0);
     const fixedToday = permanent.filter((e) => e.fixedDays.includes(day.dow) && statusOf(e.id) !== "PTO1" && underCap(e) && underStreak(e));
     if (fixedToday.length && remaining.length) {
+      const fixedCostFn = (id, shift) => shiftPref(stats[id], shift) + (repeatsPrevShift(id, shift) ? 800 : 0);
       const match = kuhnMatch(remaining, (shift) =>
         fixedToday.filter((e) => !usedIds.has(e.id) && e.allowedShifts.includes(shift)).map((e) => e.id)
-          .sort((a, b) => shiftPref(stats[a], shift) - shiftPref(stats[b], shift) || Math.random() - 0.5));
+          .sort((a, b) => fixedCostFn(a, shift) - fixedCostFn(b, shift) || Math.random() - 0.5));
       Object.entries(match).forEach(([shift, empId]) => { assignment[shift] = { empId, type: "permanent", override: false, fixed: true }; usedIds.add(empId); });
       remaining = remaining.filter((s) => !(s in match));
     }
     if (remaining.length) {
       const pool = permanent.filter((e) => !usedIds.has(e.id) && !statusOf(e.id) && underCap(e) && underStreak(e) && respectsFixedDayRestriction(e, [day.dow]));
-      const costFn = (id, shift) => shiftPref(stats[id], shift) + (isWknd ? stats[id].weekendCount * 1000 : 0) + stats[id].totalWorked * 10;
+      const costFn = (id, shift) => shiftPref(stats[id], shift) + (isWknd ? stats[id].weekendCount * 1000 : 0) + stats[id].totalWorked * 10 + (repeatsPrevShift(id, shift) ? 800 : 0);
       const match = kuhnMatch(remaining, (shift) => pool.filter((e) => !usedIds.has(e.id) && e.allowedShifts.includes(shift)).map((e) => e.id).sort((a, b) => costFn(a, shift) - costFn(b, shift) || Math.random() - 0.5));
       Object.entries(match).forEach(([shift, empId]) => { assignment[shift] = { empId, type: "permanent", override: false, fixed: false }; usedIds.add(empId); });
       remaining = remaining.filter((s) => !(s in match));
@@ -794,12 +806,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
   const computeStats = (daysArr) => {
     const stats = {};
-    permanent.forEach((e) => { stats[e.id] = { totalWorked: 0, shiftCount: Object.fromEntries(ALL_SHIFT_CODES.map((s) => [s, 0])), weekendCount: 0, weekendDaysWorked: [], workedDays: [] }; });
+    permanent.forEach((e) => { stats[e.id] = { totalWorked: 0, shiftCount: Object.fromEntries(ALL_SHIFT_CODES.map((s) => [s, 0])), weekendCount: 0, weekendDaysWorked: [], workedDays: [], codeByDay: {} }; });
     daysArr.forEach((day) => {
       Object.entries(day.assignment).forEach(([shift, info]) => {
         if (info.type === "permanent") {
           const st = stats[info.empId];
           st.totalWorked++; st.shiftCount[shift]++; st.workedDays.push(day.idx);
+          st.codeByDay[day.idx] = shift;
           if (day.isWknd) { st.weekendCount++; st.weekendDaysWorked.push(day.idx); }
         }
       });
@@ -876,10 +889,19 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     if (avoidLonelyShifts) {
       permanent.forEach((e) => { lonelyShiftPenalty += countLonelyShifts(stats[e.id].workedDays, daysArr.length); });
     }
+    // The same shift code two days running reads as monotonous — always
+    // checked (no settings toggle, unlike the grouping preferences above),
+    // weighted well above plain shift-count balance so the optimizer only
+    // trades it away to fill a gap or fix a harder violation.
+    let backToBackPenalty = 0;
+    permanent.forEach((e) => {
+      const dayEntries = daysArr.map((d) => ({ dow: d.dow, code: stats[e.id].codeByDay[d.idx] }));
+      backToBackPenalty += countBackToBackSameShift(dayEntries, isContinuityCode);
+    });
     // Each empty shift weighs more than any balance or grouping gain, so
     // the optimizer only gives up shift balance when that fills a gap.
     const emptyShifts = daysArr.reduce((sum, d) => sum + holesOnDay(d).length, 0);
-    return emptyShifts * 30 + totalSpread * 5 + shiftSpread * 1 + weekendViol * 50 + missingShiftPenalty * 40 + consecutiveRunPenalty * 35 + lonelyOffPenalty * 15 + lonelyShiftPenalty * 15;
+    return emptyShifts * 30 + totalSpread * 5 + shiftSpread * 1 + weekendViol * 50 + missingShiftPenalty * 40 + consecutiveRunPenalty * 35 + lonelyOffPenalty * 15 + lonelyShiftPenalty * 15 + backToBackPenalty * 25;
   };
 
   // Trades one employee's shift with a colleague's shift on a nearby day
@@ -1183,6 +1205,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         });
       });
 
+      // Yesterday's shift per employee, permanent staff only — deleted for
+      // anyone who doesn't work today, so an off day correctly breaks the
+      // "back to back" adjacency for whichever day they next work.
+      const prevShiftByEmp = {};
       const initialDays = days.map((day) => {
         const preToday = {};
         Object.entries(continuityByCode).forEach(([code, map]) => { if (map[day.idx]) preToday[code] = map[day.idx]; });
@@ -1195,7 +1221,16 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
             if (isWknd) { st.weekendCount++; st.weekendDaysWorked.push(day.idx); }
           } else { extraStats[entry.empId].totalWorked++; }
         });
-        return assignDay(day, stats, extraStats, preToday, capWorkedDays, extraCapWorkedDays);
+        const result = assignDay(day, stats, extraStats, preToday, capWorkedDays, extraCapWorkedDays, prevShiftByEmp);
+        const workedTodayByEmp = new Set();
+        Object.entries(result.assignment).forEach(([shift, info]) => {
+          if (info.type === "permanent") {
+            prevShiftByEmp[info.empId] = { dayIdx: day.idx, dow: day.dow, shift };
+            workedTodayByEmp.add(info.empId);
+          }
+        });
+        permanent.forEach((e) => { if (!workedTodayByEmp.has(e.id)) delete prevShiftByEmp[e.id]; });
+        return result;
       });
 
       const costBefore = costOf(initialDays, initialDays.length);
@@ -1269,7 +1304,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const optimizationTips = useMemo(() => (schedule ? buildOptimizationTips({
     schedule, feasibility, employees, ptoStatus, shiftLabel,
     settings: schedule.settingsUsed,
-  }) : []), [schedule, feasibility, employees, ptoStatus]);
+    continuityCodes: ALL_SHIFT_CODES.filter(isContinuityCode),
+  }) : []), [schedule, feasibility, employees, ptoStatus, shiftDefByCode]);
 
   const cellFor = (employee, day) => {
     const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);

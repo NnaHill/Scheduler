@@ -89,6 +89,26 @@ export function countLonelyShifts(workedDayIndices, totalDays) {
   const worked = new Set(workedDayIndices);
   return workedDayIndices.filter((idx) => idx > 0 && idx < totalDays - 1 && !worked.has(idx - 1) && !worked.has(idx + 1)).length;
 }
+// Count how many times an employee works the identical shift code on two
+// consecutive calendar days — monotonous for staff, so it's discouraged.
+// Two exceptions, same as the rest of the app: a Saturday->Sunday pair
+// (the intentional weekend-pairing behavior) and a continuity-tagged code
+// (built specifically to keep the same person on for several days).
+// `dayEntries` is an ordered array of { dow, code } for one employee, one
+// entry per calendar day in the schedule; `code` is falsy for a day not
+// worked at all, which correctly breaks the adjacency (an off day in
+// between means the two shifts aren't "back to back").
+export function countBackToBackSameShift(dayEntries, isContinuityCode) {
+  let count = 0;
+  for (let i = 0; i < dayEntries.length - 1; i++) {
+    const a = dayEntries[i], b = dayEntries[i + 1];
+    if (!a.code || !b.code || a.code !== b.code) continue;
+    if (isContinuityCode(a.code)) continue;
+    if (a.dow === 6 && b.dow === 0) continue;
+    count++;
+  }
+  return count;
+}
 // Shift codes on this day that nobody is assigned to. Derived from the
 // assignment itself so it stays correct after the optimizer moves people.
 export function unfilledShifts(day, activeShifts) {

@@ -127,4 +127,43 @@ describe("buildOptimizationTips", () => {
     const s = base();
     expect(buildOptimizationTips(s).some((t) => t.id === "weekend-pairing")).toBe(false);
   });
+
+  test("the same shift two weekdays running produces a tip naming the person", () => {
+    const s = base({ employees: [{ id: 1, name: "Ann", type: "permanent" }] });
+    s.schedule.days = [
+      day(0, { dow: 1, assignment: { COV1: { empId: 1 } } }),
+      day(1, { dow: 2, assignment: { COV1: { empId: 1 } } }),
+    ];
+    const tip = buildOptimizationTips(s).find((t) => t.id === "back-to-back");
+    expect(tip).toBeDefined();
+    expect(tip.level).toBe("tip");
+    expect(tip.summary).toContain("Ann: 1 time");
+  });
+
+  test("a continuity-tagged shift repeating is not flagged", () => {
+    const s = base({ employees: [{ id: 1, name: "Ann", type: "permanent" }], continuityCodes: ["ROV"] });
+    s.schedule.days = [
+      day(0, { dow: 1, assignment: { ROV: { empId: 1 } } }),
+      day(1, { dow: 2, assignment: { ROV: { empId: 1 } } }),
+    ];
+    expect(buildOptimizationTips(s).some((t) => t.id === "back-to-back")).toBe(false);
+  });
+
+  test("a Saturday->Sunday repeat is not flagged (weekend pairing)", () => {
+    const s = base({ employees: [{ id: 1, name: "Ann", type: "permanent" }] });
+    s.schedule.days = [
+      day(0, { dow: 6, assignment: { COV1: { empId: 1 } } }),
+      day(1, { dow: 0, assignment: { COV1: { empId: 1 } } }),
+    ];
+    expect(buildOptimizationTips(s).some((t) => t.id === "back-to-back")).toBe(false);
+  });
+
+  test("no back-to-back tip when nothing repeats", () => {
+    const s = base({ employees: [{ id: 1, name: "Ann", type: "permanent" }] });
+    s.schedule.days = [
+      day(0, { dow: 1, assignment: { COV1: { empId: 1 } } }),
+      day(1, { dow: 2, assignment: { COV2: { empId: 1 } } }),
+    ];
+    expect(buildOptimizationTips(s).some((t) => t.id === "back-to-back")).toBe(false);
+  });
 });
