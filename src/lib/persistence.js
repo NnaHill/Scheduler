@@ -88,9 +88,11 @@ const shiftDefFromRow = (r) => ({
   label: r.label || null,
   sortOrder: r.sort_order,
   activeWeekend: r.active_weekend,
+  weekendOnly: r.weekend_only || false,
   collapsed: r.collapsed,
   continuityMin: r.continuity_min,
   continuityMax: r.continuity_max,
+  overflow: r.overflow || false,
 });
 const shiftDefToRow = (d, ownerId) => ({
   owner_id: ownerId,
@@ -98,9 +100,11 @@ const shiftDefToRow = (d, ownerId) => ({
   label: d.label || null,
   sort_order: d.sortOrder,
   active_weekend: d.activeWeekend,
+  weekend_only: d.weekendOnly || false,
   collapsed: d.collapsed,
   continuity_min: d.continuityMin ?? null,
   continuity_max: d.continuityMax ?? null,
+  overflow: d.overflow || false,
 });
 
 export async function fetchShiftDefinitions(ownerId) {
@@ -226,7 +230,15 @@ export async function bulkDeleteExtraAvailability(employeeId, startIso, endIso, 
   if (error) throw error;
 }
 
+// One row per manager — each save overwrites it, so there's nothing to
+// clean up over time, and the app can read it back on login to restore
+// whatever was last generated or hand-edited.
 export async function saveScheduleSnapshot(snapshot, ownerId) {
-  const { error } = await supabase.from("saved_schedules").insert({ snapshot, owner_id: ownerId });
+  const { error } = await supabase.from("saved_schedules").upsert({ snapshot, owner_id: ownerId }, { onConflict: "owner_id" });
   if (error) throw error;
+}
+export async function fetchScheduleSnapshot(ownerId) {
+  const { data, error } = await supabase.from("saved_schedules").select("snapshot").eq("owner_id", ownerId).maybeSingle();
+  if (error) throw error;
+  return data?.snapshot || null;
 }

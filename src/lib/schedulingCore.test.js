@@ -7,6 +7,11 @@ import {
   shiftPref,
   NEVER_WORKED_BONUS,
   wouldExceedShiftCap,
+  maxShiftsInAnyWindow,
+  isOverflowKey,
+  overflowBaseCode,
+  nextOverflowKey,
+  pickOverflowDays,
   longestConsecutiveRun,
   wouldExceedConsecutiveDays,
   countLonelyDaysOff,
@@ -21,6 +26,7 @@ import {
   weekendIndexFor,
   scheduleWeekendEpoch,
   isOpenWeekend,
+  isAdjacentToOffWeekend,
   kuhnMatch,
   partitionRun,
 } from "./schedulingCore";
@@ -106,6 +112,64 @@ describe("wouldExceedShiftCap", () => {
   });
   test("days far enough apart to never share a window do not exceed", () => {
     expect(wouldExceedShiftCap(cap(14, 1), [0], [20])).toBe(false);
+  });
+});
+
+describe("maxShiftsInAnyWindow", () => {
+  test("no worked days has no peak", () => {
+    expect(maxShiftsInAnyWindow([], 14)).toBe(0);
+  });
+  test("three days clustered inside one window peak at 3", () => {
+    expect(maxShiftsInAnyWindow([0, 1, 2], 14)).toBe(3);
+  });
+  test("days spread across two separate windows peak at the denser one", () => {
+    // 0,1,2 are within 14 days of each other; day 30 is its own window
+    expect(maxShiftsInAnyWindow([0, 1, 2, 30], 14)).toBe(3);
+  });
+});
+
+describe("overflow shift (E0) helpers", () => {
+  test("isOverflowKey recognizes the base code and every numbered slot", () => {
+    expect(isOverflowKey("E0")).toBe(true);
+    expect(isOverflowKey("E0#2")).toBe(true);
+    expect(isOverflowKey("E0#17")).toBe(true);
+    expect(isOverflowKey("E1")).toBe(false);
+    expect(isOverflowKey("E01")).toBe(false);
+  });
+  test("overflowBaseCode normalizes any slot to the display code", () => {
+    expect(overflowBaseCode("E0")).toBe("E0");
+    expect(overflowBaseCode("E0#3")).toBe("E0");
+    expect(overflowBaseCode("COV1")).toBe("COV1");
+  });
+  test("nextOverflowKey picks the base code first, then numbers upward", () => {
+    expect(nextOverflowKey({})).toBe("E0");
+    expect(nextOverflowKey({ E0: {} })).toBe("E0#2");
+    expect(nextOverflowKey({ E0: {}, "E0#2": {} })).toBe("E0#3");
+    expect(nextOverflowKey({ E0: {}, "E0#3": {} })).toBe("E0#2"); // fills the gap
+  });
+});
+
+describe("pickOverflowDays", () => {
+  test("no shortfall picks nothing", () => {
+    expect(pickOverflowDays([0, 1, 2], [3, 4, 5], 14, 14, 3)).toEqual([]);
+  });
+  test("a shortfall of one picks exactly one candidate day", () => {
+    expect(pickOverflowDays([0, 1], [2, 3, 4], 14, 14, 3)).toEqual([2]);
+  });
+  test("no eligible candidate days means no picks, even with a shortfall", () => {
+    expect(pickOverflowDays([0], [], 14, 14, 3)).toEqual([]);
+  });
+  test("each non-overlapping block is topped up independently", () => {
+    // Block 1 (days 0-13) is already full; block 2 (days 14-27) needs
+    // exactly as many candidates as the shortfall, so all of them are used.
+    const worked = [0, 1, 2];
+    const candidates = [14, 15, 16];
+    expect(pickOverflowDays(worked, candidates, 28, 14, 3)).toEqual([14, 15, 16]);
+  });
+  test("picks spread across the available candidates rather than clumping", () => {
+    const picks = pickOverflowDays([], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 14, 14, 3);
+    expect(picks).toHaveLength(3);
+    expect(Math.max(...picks) - Math.min(...picks)).toBeGreaterThan(3); // not all adjacent
   });
 });
 
@@ -343,6 +407,30 @@ describe("isOpenWeekend", () => {
   test("negative weekend indices still resolve correctly (modulo safety)", () => {
     expect(isOpenWeekend({ cycleWeekends: 4, openOffset: 3 }, -1)).toBe(true);
     expect(isOpenWeekend({ cycleWeekends: 4, openOffset: 0 }, -1)).toBe(false);
+  });
+});
+
+describe("isAdjacentToOffWeekend", () => {
+  // Every-other-weekend rotation with openOffset 1, checked against
+  // WEEKEND_EPOCH (2024-01-06, a Saturday) — so weekend index 0
+  // (1/6-1/7) is their OFF weekend, and index 1 (1/13-1/14) is their ON
+  // weekend.
+  const rotation = { cycleWeekends: 2, openOffset: 1 };
+
+  test("the Friday right before an OFF weekend counts", () => {
+    expect(isAdjacentToOffWeekend(rotation, new Date("2024-01-05T00:00:00"), 5, WEEKEND_EPOCH)).toBe(true);
+  });
+  test("the Monday right after an OFF weekend counts", () => {
+    expect(isAdjacentToOffWeekend(rotation, new Date("2024-01-08T00:00:00"), 1, WEEKEND_EPOCH)).toBe(true);
+  });
+  test("the Friday before a working weekend does not count", () => {
+    expect(isAdjacentToOffWeekend(rotation, new Date("2024-01-12T00:00:00"), 5, WEEKEND_EPOCH)).toBe(false);
+  });
+  test("a day that isn't Friday or Monday never counts", () => {
+    expect(isAdjacentToOffWeekend(rotation, new Date("2024-01-03T00:00:00"), 3, WEEKEND_EPOCH)).toBe(false);
+  });
+  test("no rotation never counts", () => {
+    expect(isAdjacentToOffWeekend(null, new Date("2024-01-05T00:00:00"), 5, WEEKEND_EPOCH)).toBe(false);
   });
 });
 

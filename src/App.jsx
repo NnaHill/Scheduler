@@ -19,6 +19,7 @@ import {
   bulkUpsertExtraAvailability,
   bulkDeleteExtraAvailability,
   saveScheduleSnapshot,
+  fetchScheduleSnapshot,
   fetchShiftDefinitions,
   insertShiftDefinitions,
   upsertShiftDefinition,
@@ -26,9 +27,10 @@ import {
 } from "./lib/persistence";
 import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
-  wouldExceedShiftCap, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
-  weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, kuhnMatch, partitionRun,
+  wouldExceedShiftCap, maxShiftsInAnyWindow, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
+  weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, isAdjacentToOffWeekend, kuhnMatch, partitionRun,
   longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, countBackToBackSameShift, unfilledShifts,
+  OVERFLOW_CODE, isOverflowKey, overflowBaseCode, nextOverflowKey, pickOverflowDays,
 } from "./lib/schedulingCore";
 import { buildFeasibilityReport } from "./lib/feasibility";
 import { buildOptimizationTips } from "./lib/optimizationTips";
@@ -44,15 +46,15 @@ import AccountSettings from "./AccountSettings";
 // manager's own rows in the database are the only source of truth;
 // editing this array doesn't affect anyone who's already been seeded.
 const DEFAULT_SHIFT_DEFINITIONS = [
-  { code: "E1", label: null, sortOrder: 0, activeWeekend: true, collapsed: false, continuityMin: null, continuityMax: null },
-  { code: "E2", label: null, sortOrder: 1, activeWeekend: true, collapsed: false, continuityMin: null, continuityMax: null },
-  { code: "E3", label: null, sortOrder: 2, activeWeekend: true, collapsed: false, continuityMin: null, continuityMax: null },
-  { code: "E4", label: null, sortOrder: 3, activeWeekend: true, collapsed: false, continuityMin: null, continuityMax: null },
-  { code: "E5", label: null, sortOrder: 4, activeWeekend: false, collapsed: false, continuityMin: null, continuityMax: null },
-  { code: "E6", label: null, sortOrder: 5, activeWeekend: false, collapsed: false, continuityMin: null, continuityMax: null },
-  { code: "E7", label: null, sortOrder: 6, activeWeekend: false, collapsed: false, continuityMin: 2, continuityMax: 3 },
-  { code: "E8", label: null, sortOrder: 7, activeWeekend: true, collapsed: false, continuityMin: null, continuityMax: null },
-  { code: "E9", label: null, sortOrder: 8, activeWeekend: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E1", label: null, sortOrder: 0, activeWeekend: true, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E2", label: null, sortOrder: 1, activeWeekend: true, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E3", label: null, sortOrder: 2, activeWeekend: true, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E4", label: null, sortOrder: 3, activeWeekend: true, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E5", label: null, sortOrder: 4, activeWeekend: false, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E6", label: null, sortOrder: 5, activeWeekend: false, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E7", label: null, sortOrder: 6, activeWeekend: false, weekendOnly: false, collapsed: false, continuityMin: 2, continuityMax: 3 },
+  { code: "E8", label: null, sortOrder: 7, activeWeekend: true, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
+  { code: "E9", label: null, sortOrder: 8, activeWeekend: false, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null },
 ];
 // Default palette for the original E1-E9 codes, purely cosmetic. Any
 // other code (E10+, or a renamed/custom one) falls back to the
@@ -80,6 +82,9 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [consecutiveHardLimit, setConsecutiveHardLimit] = useState(false);
   const [groupDaysOff, setGroupDaysOff] = useState(true);
   const [avoidLonelyShifts, setAvoidLonelyShifts] = useState(true);
+  const [weekendPairingEnabled, setWeekendPairingEnabled] = useState(true);
+  const [extendOffWeekends, setExtendOffWeekends] = useState(false);
+  const [manualEditWarnings, setManualEditWarnings] = useState([]);
   const [employees, setEmployees] = useState([]);
   const [ptoStatus, setPtoStatus] = useState({});
   const [ptoSource, setPtoSource] = useState({}); // key -> 'manual' | 'weekend_rotation'
@@ -142,10 +147,43 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
           finalDefs = DEFAULT_SHIFT_DEFINITIONS;
           await insertShiftDefinitions(finalDefs, viewingOwnerId);
         }
+        // Every manager gets exactly one reserved overflow shift (E0),
+        // self-healing here if it's somehow missing — new account,
+        // account from before this feature existed, or just never got
+        // created. Renaming it is fine (like any shift); only the
+        // reserved code and the "overflow" flag matter to the scheduler.
+        // upsert (not insert) on purpose — React can run this effect
+        // twice in a row in dev, and an upsert just writes the same row
+        // twice harmlessly where a plain insert would hit a duplicate-key
+        // error the second time. Best-effort, same as the schedule
+        // restore below — this must never be able to block employees/
+        // shifts from loading.
+        if (!finalDefs.some((d) => d.overflow)) {
+          const e0Def = { code: OVERFLOW_CODE, label: null, sortOrder: finalDefs.length, activeWeekend: true, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null, overflow: true };
+          await upsertShiftDefinition(e0Def, viewingOwnerId).catch(reportSyncError);
+          finalDefs = [...finalDefs, e0Def];
+        }
         if (cancelled) return;
         setEmployees(emp);
         setHolidays(new Set(hol));
         setShiftDefinitions(finalDefs);
+        // Best-effort: restoring the last schedule is a nice-to-have, not
+        // core data, so a failure here (or an account with no saved
+        // schedule yet) must never block the rest of the app from loading.
+        const savedSchedule = await fetchScheduleSnapshot(viewingOwnerId).catch((err) => { reportSyncError(err); return null; });
+        if (cancelled) return;
+        if (savedSchedule) {
+          setSchedule(savedSchedule);
+          setNumWeeks(savedSchedule.numWeeks);
+          setStartDate(savedSchedule.startDate);
+          const s = savedSchedule.settingsUsed;
+          setMaxConsecutiveDays(s.maxConsecutiveDays);
+          setConsecutiveHardLimit(s.consecutiveHardLimit);
+          setGroupDaysOff(s.groupDaysOff);
+          setAvoidLonelyShifts(s.avoidLonelyShifts);
+          setWeekendPairingEnabled(s.weekendPairingEnabled);
+          setExtendOffWeekends(!!s.extendOffWeekends);
+        }
       } catch (err) {
         if (!cancelled) reportSyncError(err);
       } finally {
@@ -169,6 +207,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // 1 of N" always lands on the first weekend currently in view, no
   // matter what start date is picked.
   const weekendEpoch = useMemo(() => scheduleWeekendEpoch(days), [days]);
+
+  // Whether working this day would cut into an employee's off-weekend —
+  // the "extend off-weekends into a long weekend" preference uses this to
+  // softly discourage it. Only for someone on a weekend rotation, only
+  // the Friday right before or the Monday right after their OFF weekend,
+  // and never a day that's one of their fixed days — nothing to be done
+  // about those regardless, so there's no point penalizing them.
+  const breaksOffWeekend = (e, day) => {
+    if (!extendOffWeekends || !e || !e.weekendRotation || e.fixedDays.includes(day.dow)) return false;
+    return isAdjacentToOffWeekend(e.weekendRotation, day.date, day.dow, weekendEpoch);
+  };
 
   // PTO and extra-staff availability are persisted keyed by absolute
   // ISO date, independent of rotation length/start date. Re-derive the
@@ -221,8 +270,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // custom label needs a smaller font than the default 2-char codes to
   // avoid overflowing, so this scales down as the label gets longer.
   const gridCellFontSize = (label) => (label.length <= 2 ? "9px" : label.length === 3 ? "8px" : "7px");
-  const weekdayShifts = ALL_SHIFT_CODES.filter((s) => !shiftDefByCode[s].collapsed);
-  const weekendShifts = ALL_SHIFT_CODES.filter((s) => shiftDefByCode[s].activeWeekend && !shiftDefByCode[s].collapsed);
+  // The overflow shift (E0) is never a required daily slot — it only
+  // ever exists to top someone up to their guaranteed count — so it's
+  // deliberately left out of both of these; nothing that fills/checks a
+  // day's required coverage should ever see it.
+  const weekdayShifts = ALL_SHIFT_CODES.filter((s) => !shiftDefByCode[s].collapsed && !shiftDefByCode[s].weekendOnly && !shiftDefByCode[s].overflow);
+  const weekendShifts = ALL_SHIFT_CODES.filter((s) => (shiftDefByCode[s].activeWeekend || shiftDefByCode[s].weekendOnly) && !shiftDefByCode[s].collapsed && !shiftDefByCode[s].overflow);
+  // Training doesn't apply to the overflow shift — anyone with an
+  // extended-hour schedule is automatically eligible for it — so it's
+  // left out of every "Trained on" picker to avoid a toggle that does
+  // nothing.
+  const trainableShiftCodes = ALL_SHIFT_CODES.filter((s) => !shiftDefByCode[s].overflow);
   const permanent = employees.filter((e) => e.type === "permanent");
   const extra = employees.filter((e) => e.type === "extra");
 
@@ -251,6 +309,9 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // customization — the shift just displays as its own code again.
   const renameShift = (code, rawValue) => updateShiftDefinition(code, { label: rawValue.toUpperCase().slice(0, 4) || null });
   const toggleShiftWeekend = (code) => updateShiftDefinition(code, { activeWeekend: !shiftDefByCode[code].activeWeekend });
+  // Weekend-only implies weekend-active (see weekendShifts above) — no
+  // need to also tick "Weekend/holiday?" separately.
+  const toggleShiftWeekendOnly = (code) => updateShiftDefinition(code, { weekendOnly: !shiftDefByCode[code].weekendOnly });
   // Kept as "pick up to 2" — same limit the original high-turnover-mode
   // toggle always had, just now operating over each manager's own list
   // instead of a fixed shared one.
@@ -270,7 +331,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const addShiftDefinition = () => {
     const nextNum = Math.max(0, ...shiftDefinitions.map((d) => Number(/^E(\d+)$/.exec(d.code)?.[1]) || 0)) + 1;
     const code = `E${nextNum}`;
-    const newDef = { code, label: null, sortOrder: shiftDefinitions.length, activeWeekend: false, collapsed: false, continuityMin: null, continuityMax: null };
+    const newDef = { code, label: null, sortOrder: shiftDefinitions.length, activeWeekend: false, weekendOnly: false, collapsed: false, continuityMin: null, continuityMax: null };
     setShiftDefinitions((prev) => [...prev, newDef]);
     upsertShiftDefinition(newDef, viewingOwnerId).catch(reportSyncError);
     // Permanent staff default to "trained on everything" (see addPermanent)
@@ -558,7 +619,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const addPermanent = async () => {
     if (!newPermanentName.trim()) return;
     const draft = {
-      name: newPermanentName.trim(), type: "permanent", fixedDays: [], allowedShifts: [...ALL_SHIFT_CODES],
+      name: newPermanentName.trim(), type: "permanent", fixedDays: [], allowedShifts: [...trainableShiftCodes],
       shiftCap: null, weekendRotation: { cycleWeekends: 4, openOffset: 0 },
     };
     setNewPermanentName("");
@@ -579,7 +640,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const convertToPermanent = (id) =>
     setEmployees((prev) => prev.map((e) => {
       if (e.id !== id) return e;
-      const updated = { ...e, type: "permanent", allowedShifts: [...ALL_SHIFT_CODES] };
+      const updated = { ...e, type: "permanent", allowedShifts: [...trainableShiftCodes] };
       upsertEmployee(updated, viewingOwnerId).catch(reportSyncError);
       return updated;
     }));
@@ -662,8 +723,15 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     // Continuity blocks are decided first (weekdays only) but this pre-pass
     // wouldn't otherwise know about them — seed those days in up front so
     // a weekend pairing can't combine with an already-locked continuity
-    // block to quietly blow a cap window that spans both.
+    // block to quietly blow a cap window that spans both. This seeded
+    // tracker is for THIS FUNCTION'S OWN eligibility checks only — it
+    // must never be what gets returned, or the caller ends up counting
+    // every continuity day twice (once directly, once via this) when it
+    // combines continuity + weekend-pair days into capWorkedDays. Only
+    // newWeekendDaysByEmp — the days THIS pass actually assigns — is
+    // returned.
     const workedDaysByEmp = {}; permanent.forEach((e) => { workedDaysByEmp[e.id] = [...(continuityDaysByEmp?.[e.id] || [])]; });
+    const newWeekendDaysByEmp = {}; permanent.forEach((e) => { newWeekendDaysByEmp[e.id] = []; });
     const stat = {}; permanent.forEach((e) => { stat[e.id] = 0; });
     // Same reasoning as the old guarantee pre-pass: weekday assignments
     // haven't been decided yet, so fixed days are projected as "worked"
@@ -712,9 +780,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         dayAssignment[sun.idx][shift] = { empId: chosen.id, type: "permanent", override: false, fixed: true };
         stat[chosen.id] += 2;
         workedDaysByEmp[chosen.id].push(sat.idx, sun.idx);
+        newWeekendDaysByEmp[chosen.id].push(sat.idx, sun.idx);
       });
     });
-    return { dayAssignment, workedDaysByEmp };
+    return { dayAssignment, workedDaysByEmp: newWeekendDaysByEmp };
   };
 
   const assignDay = (day, stats, extraStats, preAssigned = {}, capWorkedDays, extraCapWorkedDays, prevShiftByEmp = {}) => {
@@ -769,7 +838,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     }
     if (remaining.length) {
       const pool = permanent.filter((e) => !usedIds.has(e.id) && !statusOf(e.id) && underCap(e) && underStreak(e) && respectsFixedDayRestriction(e, [day.dow]));
-      const costFn = (id, shift) => shiftPref(stats[id], shift) + (isWknd ? stats[id].weekendCount * 1000 : 0) + stats[id].totalWorked * 10 + (repeatsPrevShift(id, shift) ? 800 : 0);
+      const costFn = (id, shift) => shiftPref(stats[id], shift) + (isWknd ? stats[id].weekendCount * 1000 : 0) + stats[id].totalWorked * 10 + (repeatsPrevShift(id, shift) ? 800 : 0) + (breaksOffWeekend(pool.find((e) => e.id === id), day) ? 400 : 0);
       const match = kuhnMatch(remaining, (shift) => pool.filter((e) => !usedIds.has(e.id) && e.allowedShifts.includes(shift)).map((e) => e.id).sort((a, b) => costFn(a, shift) - costFn(b, shift) || Math.random() - 0.5));
       Object.entries(match).forEach(([shift, empId]) => { assignment[shift] = { empId, type: "permanent", override: false, fixed: false }; usedIds.add(empId); });
       remaining = remaining.filter((s) => !(s in match));
@@ -808,8 +877,9 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const stats = {};
     permanent.forEach((e) => { stats[e.id] = { totalWorked: 0, shiftCount: Object.fromEntries(ALL_SHIFT_CODES.map((s) => [s, 0])), weekendCount: 0, weekendDaysWorked: [], workedDays: [], codeByDay: {} }; });
     daysArr.forEach((day) => {
-      Object.entries(day.assignment).forEach(([shift, info]) => {
+      Object.entries(day.assignment).forEach(([rawShift, info]) => {
         if (info.type === "permanent") {
+          const shift = overflowBaseCode(rawShift);
           const st = stats[info.empId];
           st.totalWorked++; st.shiftCount[shift]++; st.workedDays.push(day.idx);
           st.codeByDay[day.idx] = shift;
@@ -889,6 +959,15 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     if (avoidLonelyShifts) {
       permanent.forEach((e) => { lonelyShiftPenalty += countLonelyShifts(stats[e.id].workedDays, daysArr.length); });
     }
+    // Working the Friday or Monday right next to a rotated employee's OFF
+    // weekend eats into the long weekend they could otherwise have. Zero
+    // when the toggle is off, same as the other grouping preferences.
+    let extendOffWeekendPenalty = 0;
+    if (extendOffWeekends) {
+      permanent.forEach((e) => {
+        stats[e.id].workedDays.forEach((idx) => { if (breaksOffWeekend(e, daysArr[idx])) extendOffWeekendPenalty++; });
+      });
+    }
     // The same shift code two days running reads as monotonous — always
     // checked (no settings toggle, unlike the grouping preferences above),
     // weighted well above plain shift-count balance so the optimizer only
@@ -901,7 +980,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     // Each empty shift weighs more than any balance or grouping gain, so
     // the optimizer only gives up shift balance when that fills a gap.
     const emptyShifts = daysArr.reduce((sum, d) => sum + holesOnDay(d).length, 0);
-    return emptyShifts * 30 + totalSpread * 5 + shiftSpread * 1 + weekendViol * 50 + missingShiftPenalty * 40 + consecutiveRunPenalty * 35 + lonelyOffPenalty * 15 + lonelyShiftPenalty * 15 + backToBackPenalty * 25;
+    return emptyShifts * 30 + totalSpread * 5 + shiftSpread * 1 + weekendViol * 50 + missingShiftPenalty * 40 + consecutiveRunPenalty * 35 + lonelyOffPenalty * 15 + lonelyShiftPenalty * 15 + backToBackPenalty * 25 + extendOffWeekendPenalty * 15;
   };
 
   // Trades one employee's shift with a colleague's shift on a nearby day
@@ -1164,6 +1243,126 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     return violations;
   };
 
+  // Everything the Fairness Report, Optimization tab, and the schedule's
+  // own violation banners show — derived purely from a finished day array,
+  // with no idea whether that array came out of the optimizer or a manual
+  // drag-and-drop edit. Both generate() and applyManualSwap() call this,
+  // so every report always matches whatever's actually on the grid.
+  const buildScheduleDerived = (finalDays) => {
+    const totalDays = finalDays.length;
+    let totalHoles = 0, totalOverrides = 0;
+    finalDays.forEach((d) => {
+      totalHoles += d.holes.length;
+      Object.values(d.assignment).forEach((info) => { if (info.override) totalOverrides++; });
+    });
+    const finalStats = computeStats(finalDays);
+    const fairness = permanent.map((e) => {
+      const st = finalStats[e.id];
+      const offDays = finalDays.filter((d) => !Object.values(d.assignment).some((a) => a.empId === e.id) && ptoStatus[key(e.id, d.idx)] !== "PTO1" && ptoStatus[key(e.id, d.idx)] !== "PTO2").length;
+      const pto1Days = finalDays.filter((d) => ptoStatus[key(e.id, d.idx)] === "PTO1").length;
+      const pto2Honored = finalDays.filter((d) => ptoStatus[key(e.id, d.idx)] === "PTO2" && !Object.values(d.assignment).some((a) => a.empId === e.id && a.override)).length;
+      const pto2Overridden = finalDays.filter((d) => ptoStatus[key(e.id, d.idx)] === "PTO2" && Object.values(d.assignment).some((a) => a.empId === e.id && a.override)).length;
+      const wd = st.weekendDaysWorked;
+      let maxGap = wd.length === 0 ? totalDays : wd[0];
+      for (let i = 1; i < wd.length; i++) maxGap = Math.max(maxGap, wd[i] - wd[i - 1]);
+      if (wd.length) maxGap = Math.max(maxGap, totalDays - 1 - wd[wd.length - 1]);
+      const weekendRuleBroken = totalDays > 28 && maxGap > 28;
+      const hasAvailability = finalDays.some((d) => ptoStatus[key(e.id, d.idx)] !== "PTO1");
+      const missingShifts = hasAvailability ? weekdayShifts.filter((s) => e.allowedShifts.includes(s) && st.shiftCount[s] === 0) : [];
+      const longestRun = longestConsecutiveRun(st.workedDays);
+      const longestRunExceeded = maxConsecutiveDays > 0 && longestRun > maxConsecutiveDays;
+      const workedSet = new Set(st.workedDays);
+      const freeIdx = finalDays.filter((d) => !workedSet.has(d.idx) && !ptoStatus[key(e.id, d.idx)]).map((d) => d.idx);
+      const lonelyDaysOff = countLonelyDaysOff(st.workedDays, freeIdx);
+      const lonelyShifts = countLonelyShifts(st.workedDays, finalDays.length);
+      return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, allowedShifts: e.allowedShifts, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded, lonelyDaysOff, lonelyShifts };
+    });
+    const extraFairness = extra.map((e) => {
+      const total = finalDays.reduce((sum, d) => sum + Object.values(d.assignment).filter((a) => a.empId === e.id && a.type === "extra").length, 0);
+      return { id: e.id, name: e.name, allowedShifts: e.allowedShifts, total };
+    });
+
+    const continuityCheck = verifyContinuity(finalDays);
+    const employeesMissingShifts = fairness.filter((f) => f.missingShifts.length > 0).length;
+    const shiftCapViolations = verifyShiftCaps(finalDays);
+    const cappedFixedDayViolations = verifyCappedFixedDays(finalDays);
+    const weekendPairingMismatches = weekendPairingEnabled ? verifyWeekendPairing(finalDays) : [];
+
+    return { days: finalDays, fairness, extraFairness, totalHoles, totalOverrides, continuityCheck, employeesMissingShifts, shiftCapViolations, cappedFixedDayViolations, weekendPairingMismatches };
+  };
+
+  // Tops every extended-hour employee up to their guaranteed shift count
+  // — the actual enforcement behind the checkbox. Runs once, after the
+  // optimizer is completely done, over whatever it produced; each person
+  // is topped up to exactly their own shortfall and nobody else's, which
+  // is what keeps this fair without needing a separate balancing step —
+  // nobody can ever get more E0 than their own gap requires. Skipped
+  // entirely if the overflow shift is missing or paused, so pausing it
+  // is the off-switch for this whole feature. Wherever a day being
+  // topped up has a real hole, or a PRN person covering a shift this
+  // employee is trained for, that's used instead of E0 — there's no
+  // reason to pad someone's hours with a placeholder, or keep paying for
+  // PRN coverage, on a day a permanent person who needs more hours could
+  // do the actual job.
+  const applyMinimumShiftGuarantees = (daysIn) => {
+    const overflowDef = shiftDefByCode[OVERFLOW_CODE];
+    if (!overflowDef || overflowDef.collapsed) return daysIn;
+    let days = daysIn;
+    permanent.filter((e) => e.shiftCap).forEach((e) => {
+      const workedDayIndices = workedDayIndicesFromSchedule(days, e.id);
+      const workedSet = new Set(workedDayIndices);
+      const candidateIndices = days
+        .filter((d) => {
+          if (workedSet.has(d.idx)) return false;
+          const st = ptoStatus[key(e.id, d.idx)];
+          if (st === "PTO1" || st === "PTO2") return false;
+          if (!respectsFixedDayRestriction(e, [d.dow])) return false;
+          if (consecutiveHardLimit && wouldExceedConsecutiveDays(workedDayIndices, [d.idx], maxConsecutiveDays)) return false;
+          return true;
+        })
+        .map((d) => d.idx);
+      const roughPicks = pickOverflowDays(workedDayIndices, candidateIndices, days.length, e.shiftCap.windowDays, e.shiftCap.maxShifts);
+      // The floor and the ceiling are the same number, so they can only
+      // disagree right at a block boundary — pickOverflowDays works in
+      // fixed blocks, but wouldExceedShiftCap (same function the ceiling
+      // itself uses) checks every SLIDING window. When they conflict, the
+      // ceiling wins: add picks one at a time, skip any that would push
+      // a sliding window over the cap. Best-effort on the floor near a
+      // boundary beats ever creating real overtime.
+      const picks = [];
+      const runningWorked = [...workedDayIndices];
+      roughPicks.forEach((idx) => {
+        if (wouldExceedShiftCap(e, runningWorked, [idx])) return;
+        picks.push(idx);
+        runningWorked.push(idx);
+      });
+      if (picks.length === 0) return;
+      const pickSet = new Set(picks);
+      days = days.map((d) => {
+        if (!pickSet.has(d.idx)) return d;
+        // A real shift this person is trained for always beats a generic
+        // E0 filler, on that same day, two ways at once: it counts
+        // toward their guarantee AND covers actual need instead of
+        // padding hours — so there's no reason to call in (or keep) PRN
+        // on a day someone who needs more hours could cover it directly.
+        // Prefer an outright hole first, then a PRN-covered shift to
+        // take over; only fall back to E0 when neither exists.
+        const holeCode = d.holes.find((code) => e.allowedShifts.includes(code));
+        const prnEntry = Object.entries(d.assignment).find(([code, info]) => info.type === "extra" && e.allowedShifts.includes(code));
+        const newAssignment = { ...d.assignment };
+        if (holeCode) {
+          newAssignment[holeCode] = { empId: e.id, type: "permanent", override: false, fixed: false };
+        } else if (prnEntry) {
+          newAssignment[prnEntry[0]] = { empId: e.id, type: "permanent", override: false, fixed: false };
+        } else {
+          newAssignment[nextOverflowKey(d.assignment)] = { empId: e.id, type: "permanent", override: false, fixed: false };
+        }
+        return { ...d, assignment: newAssignment, holes: holesOnDay({ ...d, assignment: newAssignment }) };
+      });
+    });
+    return days;
+  };
+
   const generate = () => {
     setGenerating(true);
     setTimeout(() => {
@@ -1184,7 +1383,12 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         });
       });
 
-      const { dayAssignment: weekendPaired, workedDaysByEmp: weekendPairedDays } = assignWeekendPairs(continuityDaysByEmp);
+      // Switched off: skip the pairing pre-pass entirely, so weekends get
+      // filled by the normal per-day walk like any other day — same empty
+      // shape the pre-pass itself would return if nobody was eligible.
+      const { dayAssignment: weekendPaired, workedDaysByEmp: weekendPairedDays } = weekendPairingEnabled
+        ? assignWeekendPairs(continuityDaysByEmp)
+        : { dayAssignment: {}, workedDaysByEmp: Object.fromEntries(permanent.map((e) => [e.id, []])) };
 
       // Continuity blocks and paired weekend days are both decided for
       // the WHOLE rotation in one shot above, before any regular-day
@@ -1235,55 +1439,109 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
       const costBefore = costOf(initialDays, initialDays.length);
       const { days: searchedDays, finalCost: costAfter } = localSearch(initialDays, 2500);
-      const optimizedDays = searchedDays.map((d) => ({ ...d, holes: holesOnDay(d) }));
+      const optimizedDays = applyMinimumShiftGuarantees(searchedDays.map((d) => ({ ...d, holes: holesOnDay(d) })));
 
-      let totalHoles = 0, totalOverrides = 0;
-      optimizedDays.forEach((d) => {
-        totalHoles += d.holes.length;
-        Object.values(d.assignment).forEach((info) => { if (info.override) totalOverrides++; });
-      });
-
-      const totalDays = optimizedDays.length;
-      const finalStats = computeStats(optimizedDays);
-      const fairness = permanent.map((e) => {
-        const st = finalStats[e.id];
-        const offDays = optimizedDays.filter((d) => !Object.values(d.assignment).some((a) => a.empId === e.id) && ptoStatus[key(e.id, d.idx)] !== "PTO1" && ptoStatus[key(e.id, d.idx)] !== "PTO2").length;
-        const pto1Days = optimizedDays.filter((d) => ptoStatus[key(e.id, d.idx)] === "PTO1").length;
-        const pto2Honored = optimizedDays.filter((d) => ptoStatus[key(e.id, d.idx)] === "PTO2" && !Object.values(d.assignment).some((a) => a.empId === e.id && a.override)).length;
-        const pto2Overridden = optimizedDays.filter((d) => ptoStatus[key(e.id, d.idx)] === "PTO2" && Object.values(d.assignment).some((a) => a.empId === e.id && a.override)).length;
-        const wd = st.weekendDaysWorked;
-        let maxGap = wd.length === 0 ? totalDays : wd[0];
-        for (let i = 1; i < wd.length; i++) maxGap = Math.max(maxGap, wd[i] - wd[i - 1]);
-        if (wd.length) maxGap = Math.max(maxGap, totalDays - 1 - wd[wd.length - 1]);
-        const weekendRuleBroken = totalDays > 28 && maxGap > 28;
-        const hasAvailability = optimizedDays.some((d) => ptoStatus[key(e.id, d.idx)] !== "PTO1");
-        const missingShifts = hasAvailability ? weekdayShifts.filter((s) => e.allowedShifts.includes(s) && st.shiftCount[s] === 0) : [];
-        const longestRun = longestConsecutiveRun(st.workedDays);
-        const longestRunExceeded = maxConsecutiveDays > 0 && longestRun > maxConsecutiveDays;
-        const workedSet = new Set(st.workedDays);
-        const freeIdx = optimizedDays.filter((d) => !workedSet.has(d.idx) && !ptoStatus[key(e.id, d.idx)]).map((d) => d.idx);
-        const lonelyDaysOff = countLonelyDaysOff(st.workedDays, freeIdx);
-        const lonelyShifts = countLonelyShifts(st.workedDays, optimizedDays.length);
-        return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, allowedShifts: e.allowedShifts, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded, lonelyDaysOff, lonelyShifts };
-      });
-      const extraFairness = extra.map((e) => {
-        const total = optimizedDays.reduce((sum, d) => sum + Object.values(d.assignment).filter((a) => a.empId === e.id && a.type === "extra").length, 0);
-        return { id: e.id, name: e.name, allowedShifts: e.allowedShifts, total };
-      });
-
-      const continuityCheck = verifyContinuity(optimizedDays);
-      const employeesMissingShifts = fairness.filter((f) => f.missingShifts.length > 0).length;
-      const shiftCapViolations = verifyShiftCaps(optimizedDays);
-      const cappedFixedDayViolations = verifyCappedFixedDays(optimizedDays);
-      const weekendPairingMismatches = verifyWeekendPairing(optimizedDays);
-
-      const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts };
-      const scheduleSnapshot = { settingsUsed, days: optimizedDays, fairness, extraFairness, totalHoles, totalOverrides, costBefore, costAfter, iterations: 2500, continuityCheck, employeesMissingShifts, shiftCapViolations, cappedFixedDayViolations, weekendPairingMismatches, numWeeks, startDate };
+      const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts, weekendPairingEnabled, extendOffWeekends };
+      const scheduleSnapshot = { settingsUsed, costBefore, costAfter, iterations: 2500, numWeeks, startDate, ...buildScheduleDerived(optimizedDays) };
       setSchedule(scheduleSnapshot);
+      setManualEditWarnings([]);
       saveScheduleSnapshot(scheduleSnapshot, viewingOwnerId).catch(reportSyncError);
       setGenerating(false);
       setTab("schedule");
     }, 30);
+  };
+
+  // Manual drag-and-drop editing of an already-generated schedule. A
+  // continuity-tagged shift can't be dragged or dropped onto — a
+  // single-cell swap would silently break a multi-day commitment that's
+  // supposed to be locked together — and a day that's someone's approved
+  // PTO-1 leave can't be dropped onto either, so a slip of the mouse can't
+  // quietly override it.
+  const canDragCell = (code) => ALL_SHIFT_CODES.includes(code) && !isContinuityCode(code);
+  const canDropOnCell = (emp, day) => {
+    if (ptoStatus[key(emp.id, day.idx)] === "PTO1") return false;
+    return !isContinuityCode(cellFor(emp, day).code);
+  };
+
+  // Soft, non-blocking heads-up for a swap that puts someone somewhere the
+  // auto-generated schedule never would have — same philosophy as every
+  // other "preference" in this app: tell the manager, don't stop them.
+  const manualEditWarning = (newDays, emp, dayIdx, newCode) => {
+    if (!newCode) return [];
+    const warnings = [];
+    if (!emp.allowedShifts.includes(newCode)) warnings.push(`${emp.name} isn't trained on ${shiftLabel(newCode)}.`);
+    if (emp.type === "permanent") {
+      const workedDays = newDays.filter((d) => Object.values(d.assignment).some((a) => a.empId === emp.id)).map((d) => d.idx);
+      const otherWorkedDays = workedDays.filter((idx) => idx !== dayIdx);
+      if (wouldExceedShiftCap(emp, otherWorkedDays, [dayIdx])) warnings.push(`${emp.name} is now over their shift cap.`);
+      if (consecutiveHardLimit && wouldExceedConsecutiveDays(otherWorkedDays, [dayIdx], maxConsecutiveDays)) warnings.push(`${emp.name} now has too many days in a row.`);
+    }
+    return warnings;
+  };
+
+  // Shared tail for every manual edit (swap or fill): rebuild every report
+  // from the edited day array and log it the same way generate() does.
+  // One place, so a future third kind of manual edit gets this for free.
+  const recomputeAndPersistSchedule = (prev, newDays) => {
+    const updated = { ...prev, ...buildScheduleDerived(newDays), costAfter: costOf(newDays, newDays.length) };
+    saveScheduleSnapshot(updated, viewingOwnerId).catch(reportSyncError);
+    return updated;
+  };
+
+  // Swaps what two existing cells show — each stays tied to its own
+  // (employee, day); only the shift code (or lack of one) each displays
+  // trades places. See buildScheduleDerived for why every report updates
+  // automatically from this alone.
+  const applyManualSwap = (empA, dayIdxA, empB, dayIdxB) => {
+    setSchedule((prev) => {
+      if (!prev) return prev;
+      // Clone into a working array first, then pull dayA/dayB FROM that
+      // array (not from prev.days) — when dayIdxA === dayIdxB (swapping
+      // two people's shifts on the same day), dayA and dayB must end up
+      // as the exact same cloned object, or one clone's edits silently
+      // overwrite the other's.
+      const workingDays = [...prev.days];
+      const cloneDay = (idx) => { workingDays[idx] = { ...workingDays[idx], assignment: { ...workingDays[idx].assignment } }; return workingDays[idx]; };
+      const dayA = cloneDay(dayIdxA);
+      const dayB = dayIdxB === dayIdxA ? dayA : cloneDay(dayIdxB);
+
+      const entryA = Object.entries(dayA.assignment).find(([, info]) => info.empId === empA.id);
+      const entryB = Object.entries(dayB.assignment).find(([, info]) => info.empId === empB.id);
+      const [codeA] = entryA || [null];
+      const [codeB] = entryB || [null];
+      if (!codeA && !codeB) return prev;
+
+      if (codeA) delete dayA.assignment[codeA];
+      if (codeB) delete dayB.assignment[codeB];
+      if (codeB) dayA.assignment[codeB] = { empId: empA.id, type: empA.type, override: false, fixed: false, manual: true };
+      if (codeA) dayB.assignment[codeA] = { empId: empB.id, type: empB.type, override: false, fixed: false, manual: true };
+      dayA.holes = holesOnDay(dayA);
+      dayB.holes = holesOnDay(dayB);
+
+      setManualEditWarnings([
+        ...manualEditWarning(workingDays, empA, dayIdxA, codeB),
+        ...manualEditWarning(workingDays, empB, dayIdxB, codeA),
+      ]);
+      return recomputeAndPersistSchedule(prev, workingDays);
+    });
+  };
+
+  // Fills a coverage gap directly — no one to swap with, so this is a
+  // pure addition rather than a trade. Same warning/report pipeline as a
+  // swap; the only difference is there's nothing to remove on the other
+  // side.
+  const applyManualFill = (targetEmp, dayIdx, code) => {
+    setSchedule((prev) => {
+      if (!prev) return prev;
+      const workingDays = [...prev.days];
+      const day = { ...workingDays[dayIdx], assignment: { ...workingDays[dayIdx].assignment } };
+      day.assignment[code] = { empId: targetEmp.id, type: targetEmp.type, override: false, fixed: false, manual: true };
+      day.holes = holesOnDay(day);
+      workingDays[dayIdx] = day;
+
+      setManualEditWarnings(manualEditWarning(workingDays, targetEmp, dayIdx, code));
+      return recomputeAndPersistSchedule(prev, workingDays);
+    });
   };
 
   const summary = useMemo(() => {
@@ -1309,7 +1567,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
   const cellFor = (employee, day) => {
     const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
-    if (entry) return { code: entry[0], override: entry[1].override };
+    if (entry) return { code: overflowBaseCode(entry[0]), override: entry[1].override, manual: entry[1].manual };
     const k = key(employee.id, day.idx);
     const st = ptoStatus[k];
     // A weekend blocked off by their rotation cycle isn't the same thing
@@ -1322,13 +1580,47 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     return { code: "OFF" };
   };
 
+  // Live "how loaded is this person right now" readout for the tally
+  // column — recomputed from the CURRENT schedule.days, so it updates the
+  // moment a drag-and-drop move or gap fill changes anything. For a
+  // capped employee this is their actual peak shift count in any window
+  // their own cap uses, compared to that cap; uncapped just shows their
+  // running total. PTO-1 needs no special handling here — worked day
+  // indices only ever include a day someone was actually assigned, which
+  // a PTO-1 day never is.
+  const shiftTallyFor = (employee) => {
+    const worked = workedDayIndicesFromSchedule(schedule.days, employee.id);
+    if (!employee.shiftCap) return { current: worked.length, cap: null, over: false };
+    const current = maxShiftsInAnyWindow(worked, employee.shiftCap.windowDays);
+    return { current, cap: employee.shiftCap.maxShifts, over: current > employee.shiftCap.maxShifts };
+  };
+
+  // Every unfilled shift, flattened to one row per (day, code) — feeds
+  // the "Fill a coverage gap" card. Empty once nothing's left to fill.
+  const gapsList = schedule ? schedule.days.flatMap((d) => d.holes.map((code) => ({ day: d, code }))) : [];
+  // Who could plausibly take a given gap: not already working that day
+  // (hard — a person can't be in two places at once) and not on
+  // approved PTO-1 leave / marked unavailable that day (hard, same rule
+  // drag-and-drop uses). Trained-or-not is left to the dropdown's label
+  // and the warning banner, not filtered out, so a manager can still
+  // deliberately use someone not formally trained if that's their call.
+  const eligibleCandidatesFor = (day, code) => {
+    const alreadyWorking = new Set(Object.values(day.assignment).map((a) => a.empId));
+    const permCandidates = permanent.filter((e) => !alreadyWorking.has(e.id) && ptoStatus[key(e.id, day.idx)] !== "PTO1");
+    const prnCandidates = extra.filter((e) => !alreadyWorking.has(e.id) && extraAvailable[key(e.id, day.idx)]);
+    return [...permCandidates, ...prnCandidates]
+      .map((e) => ({ ...e, trained: e.allowedShifts.includes(code) }))
+      .sort((a, b) => (b.trained - a.trained) || a.name.localeCompare(b.name));
+  };
+
   const renderScheduleTable = (list, title) => (
     <div className="bg-white rounded-lg border border-[#E4E7EC] overflow-x-auto mb-4">
       <div className="px-4 py-2 border-b border-[#E4E7EC] text-sm font-semibold">{title}</div>
       <table className="text-xs border-collapse">
         <thead>
           <tr>
-            <th className="sticky left-0 bg-white z-10 text-left px-3 py-2 border-b border-[#E4E7EC] min-w-[150px]">Employee</th>
+            <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[46px]" title="Shifts right now vs. their extended-hour cap (or just a running total if they're not capped) — updates live as you drag or fill gaps.">Shifts</th>
+            <th className="sticky left-[46px] bg-white z-10 text-left px-3 py-2 border-b border-[#E4E7EC] min-w-[150px]">Employee</th>
             {schedule.days.map((d) => (
               <th key={d.idx} className={`px-1 py-2 border-b border-[#E4E7EC] font-normal text-center min-w-[36px] ${d.isWknd ? "bg-[#F1F5F9]" : ""}`}>
                 <div className="text-[#64748B]">{d.wd[0]}</div><div className="text-[10px]">{d.md}</div>
@@ -1338,33 +1630,62 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
           </tr>
         </thead>
         <tbody>
-          {list.map((emp) => (
+          {list.map((emp) => {
+            const tally = shiftTallyFor(emp);
+            return (
             <tr key={emp.id}>
-              <td className="sticky left-0 bg-white z-10 px-3 py-1 border-b border-[#F1F5F9] font-medium">
+              <td
+                className="sticky left-0 bg-white z-10 px-1 py-1 border-b border-[#F1F5F9] text-center font-semibold"
+                style={{ color: tally.over ? "#DC2626" : "#64748B" }}
+                title={tally.cap != null ? `Peak ${tally.current} shifts in any ${emp.shiftCap.windowDays}-day window, capped at ${tally.cap}` : `${tally.current} shifts total — no cap set`}
+              >
+                {tally.cap != null ? `${tally.current}/${tally.cap}` : tally.current}
+              </td>
+              <td className="sticky left-[46px] bg-white z-10 px-3 py-1 border-b border-[#F1F5F9] font-medium">
                 {emp.name}{emp.type === "extra" && <span className="ml-1 text-[9px] text-[#64748B]">PRN</span>}
               </td>
               {schedule.days.map((d) => {
-                const { code, override } = cellFor(emp, d);
+                const { code, override, manual } = cellFor(emp, d);
                 const isShift = ALL_SHIFT_CODES.includes(code);
                 const displayText = code === "OFF" ? "" : isShift ? shiftLabel(code) : code;
                 const bg = isShift ? getShiftColor(code) : (code === "PTO-1" || code === "WKND") ? "#DC2626" : code === "PTO-2" ? "#F59E0B" : code === "OFF" ? "#E4E7EC" : "transparent";
                 const fg = isShift || code === "PTO-1" || code === "WKND" || code === "PTO-2" ? "#fff" : "#64748B";
+                const draggable = canDragCell(code);
+                const droppable = canDropOnCell(emp, d);
                 return (
                   <td key={d.idx} className="border-b border-[#F1F5F9] p-0.5 text-center">
                     <div
-                      className="w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"
-                      style={{ background: bg, color: fg, fontSize: gridCellFontSize(displayText), border: override ? "2px dashed #F59E0B" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none" }}
-                      title={code === "WKND" ? "Off per weekend rotation — not approved leave" : isShift && displayText !== code ? code : undefined}
+                      className="relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"
+                      style={{
+                        background: bg, color: fg, fontSize: gridCellFontSize(displayText),
+                        border: override ? "2px dashed #F59E0B" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none",
+                        cursor: draggable ? "grab" : droppable ? "copy" : "default",
+                      }}
+                      title={code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
+                      draggable={draggable}
+                      onDragStart={draggable ? (e) => { e.dataTransfer.setData("application/json", JSON.stringify({ empId: emp.id, dayIdx: d.idx })); e.dataTransfer.effectAllowed = "move"; } : undefined}
+                      onDragOver={droppable ? (e) => e.preventDefault() : undefined}
+                      onDrop={droppable ? (e) => {
+                        e.preventDefault();
+                        const raw = e.dataTransfer.getData("application/json");
+                        if (!raw) return;
+                        const { empId: sourceEmpId, dayIdx: sourceDayIdx } = JSON.parse(raw);
+                        if (sourceEmpId === emp.id && sourceDayIdx === d.idx) return;
+                        const sourceEmp = [...permanent, ...extra].find((x) => x.id === sourceEmpId);
+                        if (sourceEmp) applyManualSwap(sourceEmp, sourceDayIdx, emp, d.idx);
+                      } : undefined}
                     >
                       {displayText}{override ? "*" : ""}
+                      {manual && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[#0D9488] border border-white" />}
                     </div>
                   </td>
                 );
               })}
             </tr>
-          ))}
+            );
+          })}
           <tr>
-            <td className="sticky left-0 bg-white z-10 px-3 py-1 font-semibold text-[#DC2626]">⚠ Coverage gaps</td>
+            <td colSpan={2} className="sticky left-0 bg-white z-10 px-3 py-1 font-semibold text-[#DC2626]">⚠ Coverage gaps</td>
             {schedule.days.map((d) => (
               <td key={d.idx} className="text-center p-0.5">
                 {d.holes.length > 0 ? (
@@ -1491,13 +1812,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 <h3 className="text-sm font-semibold mb-1">Manage shifts — also on this tab</h3>
                 <p className="text-xs text-[#33405A] mb-1">This is where you define the actual shift codes your team uses (renamed to whatever you call them). One row per shift:</p>
                 <ul className="list-disc pl-9 text-xs text-[#33405A] space-y-1 mb-2">
-                  <li><b>Code</b> — the shift's permanent internal ID. Doesn't change.</li>
                   <li><b>Name</b> — what actually shows on the schedule grid (up to 4 characters).</li>
-                  <li><b>Weekend/holiday?</b> — tick this if the shift runs on weekends and holidays.</li>
+                  <li><b>Weekend/holiday?</b> — tick this if the shift runs on weekends and holidays, in addition to weekdays.</li>
+                  <li><b>Weekend only?</b> — tick this if the shift should <i>never</i> run Monday–Friday, only Saturday, Sunday, and holidays. Ticking it counts as "Weekend/holiday?" automatically — no need to tick both.</li>
                   <li><b>Continuity?</b> — tick this if the same person must stay on this shift for several days in a row once assigned. The <b>Days</b> column sets that range — see the warning box in the screenshot for which ranges actually work.</li>
                   <li><b>Paused?</b> — takes a shift out of rotation temporarily without deleting its history (max 2 at once).</li>
                 </ul>
-                <img src="/instructions/manage-shifts.png" alt="Manage shifts table with Code, Name, Weekend/holiday, Continuity, Days, and Paused columns" className="w-full rounded border border-[#E4E7EC]" />
+                <img src="/instructions/manage-shifts.png" alt="Manage shifts table with Name, Weekend/holiday, Weekend only, Continuity, Days, and Paused columns" className="w-full rounded border border-[#E4E7EC]" />
               </div>
 
               <div className="border-t border-[#F1F5F9] pt-3 mt-3">
@@ -1509,16 +1830,19 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li>Add each employee by name.</li>
                   <li>Tick the days they always work (fixed days), if any.</li>
                   <li>Set their <b>weekend rotation</b> — how often they're on duty for a weekend.</li>
-                  <li><b>Weekend pairing:</b> on someone's on weekend, the app tries to put them on the exact same shift both Saturday and Sunday — never working days on Saturday and evenings on Sunday. This only applies to Permanent Staff; PRN/backup staff are exempt by design, since they're meant to fill gaps, not hold a weekend pattern.</li>
+                  <li><b>Weekend pairing:</b> on someone's on weekend, the app tries to put them on the exact same shift both Saturday and Sunday — never working days on Saturday and evenings on Sunday. This only applies to Permanent Staff; PRN/backup staff are exempt by design, since they're meant to fill gaps, not hold a weekend pattern. Turn it off entirely with "Pair Saturday/Sunday to the same person" on the Setup tab if you'd rather Saturday and Sunday be filled independently.</li>
+                  <li><b>Extend off-weekends:</b> tick "Extend off-weekends into longer weekends" on the Setup tab and the app also tries to give rotated staff the Friday before and Monday after their OFF weekend, turning it into a 4-day break. It's a preference, not a guarantee — it won't leave a shift empty just to stretch someone's weekend, and it skips anyone whose Friday or Monday is one of their fixed days (nothing to be done about those anyway).</li>
                 </ul>
                 <img src="/instructions/employee-row.png" alt="One employee row showing fixed days, extended-hour cap, and weekend rotation" className="w-full rounded border border-[#E4E7EC] mb-2" />
 
-                <h3 className="text-sm font-semibold mb-1">"Extended-hour schedule" — use it for two different reasons</h3>
-                <p className="text-xs text-[#33405A] mb-1">This one checkbox covers two real situations. Don't skip it just because someone doesn't work 10s or 12s:</p>
+                <h3 className="text-sm font-semibold mb-1">"Extended-hour schedule" — now a guarantee, not just a ceiling</h3>
+                <p className="text-xs text-[#33405A] mb-1">This checkbox covers two real situations. Don't skip it just because someone doesn't work 10s or 12s:</p>
                 <ul className="list-disc pl-9 text-xs text-[#33405A] space-y-1 mb-2">
-                  <li><b>1. Compressed schedules.</b> Anyone working 10-hour or 12-hour shifts — they naturally need fewer shifts to hit full-time hours, so give them a cap that reflects that (e.g. 6 shifts per 14 days).</li>
-                  <li><b>2. Regular 8-hour staff too.</b> Recommended: use it to cap them at no more than 10 shifts in any 14-day period — this is <b>not</b> the same as consecutive days. It's a running total (10 shifts spread across 14 days, worked in any pattern), separate from the Max Consecutive Days streak rule. Use both together for full protection: one guards against too many days total, the other against too many days in a row.</li>
+                  <li><b>1. Compressed schedules.</b> Anyone working 10-hour or 12-hour shifts — they naturally need fewer shifts to hit full-time hours, so give them a number that reflects that (e.g. 6 shifts per 14 days).</li>
+                  <li><b>2. Regular 8-hour staff too.</b> Recommended: cap them at no more than 10 shifts in any 14-day period — this is <b>not</b> the same as consecutive days. It's a running total (10 shifts spread across 14 days, worked in any pattern), separate from the Max Consecutive Days streak rule. Use both together: one guards against too many days total, the other against too many days in a row.</li>
                 </ul>
+                <p className="text-xs text-[#33405A] mb-1"><b>The number is now a real guarantee, not just a "don't go over" ceiling.</b> The app makes sure each extended-hour person actually reaches it every period — the only accepted reason to fall short is approved PTO-1. When someone needs topping up, the app looks for a real reason first: an empty shift they're trained for, or a shift a PRN person is covering that they could take instead — no sense paying for PRN backup on a day someone who needs more hours could just do the job. Only when neither exists does it fall back to the reserved overflow shift (<b>E0</b>), which can go to more than one person the same day, and nobody ever gets more of it than their own personal shortfall — so it never piles onto one person.</p>
+                <p className="text-xs text-[#33405A] mb-2">E0 shows up automatically in Manage Shifts (rename it to whatever you call this, like "ON CALL" or "ADMIN") — it's marked "Overflow" and can't be removed, only paused. Pausing it turns the whole guarantee off; the app goes back to pure best-effort balancing.</p>
 
                 <h3 className="text-sm font-semibold mb-1">Apply weekend rotation — the final step</h3>
                 <p className="text-xs text-[#33405A] mb-2">Setting someone's rotation group only records the setting — it doesn't block anything yet. Click this button to actually write those off-weekends onto the schedule as hard blocks. Safe to click again any time you change a rotation or add staff — it never touches a day you've edited by hand.</p>
@@ -1564,10 +1888,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li>Every employee, every day, color-coded by shift.</li>
                   <li>A pulsing red <b>HOLE</b> badge means that shift couldn't be filled — hover it to see which shift and why.</li>
                   <li>An amber banner reading "couldn't be paired to the same person" means weekend pairing (see Permanent Staff above) couldn't find anyone free both Saturday and Sunday for that shift — it's a heads-up, not an error, and it tells you exactly which weekend to check.</li>
-                  <li><b>Export CSV</b> turns it into a spreadsheet. <b>Regenerate</b> reruns the optimizer if you want another pass.</li>
+                  <li><b>Shifts column</b> (left of Employee) — their current shift count right now, live. Capped staff show "current/cap" using their actual extended-hour cap, and it turns red if a manual move pushes them over it; uncapped staff just show a running total. It recalculates the instant you drag a cell or fill a gap, so it's your built-in "am I overloading anyone" checkpoint.</li>
+                  <li><b>Drag any shift cell onto another to swap them by hand.</b> Both people trade places — nobody just disappears. A small teal dot marks a cell you've moved. Fairness Report, Optimization, and Export CSV all update to match immediately. A continuity shift can't be dragged or dropped onto (it's a locked multi-day block), and neither can someone's approved PTO-1 leave day. If a swap puts someone on a shift they're not trained for or over a limit, you'll get an amber warning — it still goes through, since it's your call, but you'll know.</li>
+                  <li>Dragging someone <i>away</i> from a day they were covering, onto a day where the other person wasn't working, leaves their original day empty — that's not a bug. Nobody automatically backfills it, so it shows up honestly as a new Coverage gap instead of silently vanishing.</li>
+                  <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
+                  <li><b>Export CSV</b> turns it into a spreadsheet, including any manual swaps or gap-fills you've made. <b>Regenerate</b> reruns the optimizer from scratch if you want another pass — this discards any manual edits.</li>
                 </ul>
                 <img src="/instructions/schedule-grid.png" alt="Schedule grid with fairness score, a warning about unfillable shifts, the legend, and export/regenerate buttons" className="w-full rounded border border-[#E4E7EC] mb-2" />
-                <img src="/instructions/weekend-pairing.png" alt="Schedule grid showing Saturday and Sunday columns with the same employee on the same shift code both days" className="w-full rounded border border-[#E4E7EC]" />
+                <img src="/instructions/weekend-pairing.png" alt="Schedule grid showing Saturday and Sunday columns with the same employee on the same shift code both days" className="w-full rounded border border-[#E4E7EC] mb-2" />
+                <img src="/instructions/shift-tally.png" alt="Schedule grid with a new Shifts column to the left of Employee, showing each person's current shift count against their cap" className="w-full rounded border border-[#E4E7EC] mb-2" />
+                <img src="/instructions/drag-swap.png" alt="Two employees' Monday shifts after being swapped by dragging, each marked with a small teal dot showing it was manually moved" className="w-full rounded border border-[#E4E7EC] mb-2" />
+                <img src="/instructions/fill-gap.png" alt="Fill a coverage gap card listing each empty shift with a dropdown to assign a permanent or PRN employee directly" className="w-full rounded border border-[#E4E7EC]" />
               </div>
 
               <div className="border-t border-[#F1F5F9] pt-3 mt-3">
@@ -1595,10 +1926,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 {[
                   ["Feasibility check", "Shows up on Setup, before you even generate. Tells you if you have enough people for the weeks ahead. Red numbers = you're short — add staff or backup coverage first."],
                   ["Weekend rotation", "Not everyone should work every weekend. Set how often someone's on duty (e.g. one weekend a month) — the app blocks their off weekends and protects their on weekend."],
-                  ["Weekend pairing", "On someone's on weekend, Saturday and Sunday are kept as the same shift for the same person, best-effort. Permanent Staff only — PRN is exempt. Can't be paired? You'll get a clear amber warning on Schedule, not a silent mismatch."],
+                  ["Weekend pairing", "On someone's on weekend, Saturday and Sunday are kept as the same shift for the same person, best-effort. Permanent Staff only — PRN is exempt. Can't be paired? You'll get a clear amber warning on Schedule, not a silent mismatch. Switch it off on the Setup tab if you'd rather Saturday and Sunday be filled independently."],
+                  ["Extend off-weekends", "Opt-in on the Setup tab. For rotated staff, tries to also give them the Friday before and Monday after their OFF weekend, for a longer break. Best-effort — never leaves a shift empty just to stretch someone's weekend, and skips any day that's already one of their fixed days."],
                   ["Fixed work days", "For people who always work the same days (like Mon–Fri). Their schedule locks to those days and never gets moved around."],
                   ["Max consecutive days", "Nobody wants a 10-day stretch with no day off. Set your limit. Soft = the app tries to avoid it. Hard = it's guaranteed, and backup staff cover the gap instead."],
-                  ["Extended-hour cap", "Caps total shifts in a rolling window (e.g. 10 per 14 days) — a running total, not a streak. Use for 10s/12s staff, or as an overtime guard on regular 8-hour staff too."],
+                  ["Extended-hour cap", "A guaranteed shift count per rolling window (e.g. 10 per 14 days), not just a ceiling — a running total, not a streak. The app tops shortfalls up with the reserved E0 overflow shift; only approved PTO-1 is accepted as a reason to fall short."],
                   ["Export to CSV", "One click turns the finished schedule into a spreadsheet file — print it, email it, or drop it into whatever else you use."],
                   ["Manage shifts", "Rename shifts, add or remove them, and set \"continuity\" rules for shifts that need the same person for a few days straight."],
                 ].map(([title, body]) => (
@@ -1722,6 +2054,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   Avoid lonely shifts
                 </label>
               </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#64748B] mb-1">Weekends</label>
+                <label className="flex items-center gap-1 text-[11px] text-[#64748B] cursor-pointer" title="On: if it's someone's weekend to work, try to put them on the same shift both Saturday and Sunday. Off: Saturday and Sunday are filled independently, same as any other day.">
+                  <input type="checkbox" checked={weekendPairingEnabled} onChange={(e) => setWeekendPairingEnabled(e.target.checked)} />
+                  Pair Saturday/Sunday to the same person
+                </label>
+                <label className="flex items-center gap-1 text-[11px] text-[#64748B] cursor-pointer" title="On: for anyone on a weekend rotation, try to also give them the Friday before and Monday after their OFF weekend, turning it into a longer weekend. A preference, not a guarantee — it won't leave a shift empty just to stretch someone's weekend.">
+                  <input type="checkbox" checked={extendOffWeekends} onChange={(e) => setExtendOffWeekends(e.target.checked)} />
+                  Extend off-weekends into longer weekends
+                </label>
+              </div>
               <div className="flex-1" />
               {permanent.length === 0 && (
                 <p className="text-xs text-[#DC2626] mr-2">Add at least one permanent employee (Permanent Staff tab) before generating.</p>
@@ -1836,6 +2179,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <div className="text-sm font-semibold mb-1">Manage shifts</div>
               <p className="text-xs text-[#64748B] mb-3">
                 Your own shift roster — add as many as you need, rename any (up to 4 characters so it still fits the schedule grid), and mark which ones run on weekends/holidays.
+                "Weekend only" takes it a step further — that shift never appears Monday-Friday at all, only on Saturday, Sunday, and holidays.
                 "Continuity" means once assigned, an employee must work it for a run of consecutive days in that range — never more, never less. "Paused" temporarily removes a shift
                 from the rotation without deleting it (pick up to 2).
               </p>
@@ -1846,9 +2190,9 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 <table className="text-xs border-collapse w-full">
                   <thead>
                     <tr className="text-[#64748B] text-left">
-                      <th className="pr-3 py-1">Code</th>
                       <th className="pr-3 py-1">Name</th>
                       <th className="pr-3 py-1 text-center">Weekend/<br />holiday?</th>
+                      <th className="pr-3 py-1 text-center">Weekend<br />only?</th>
                       <th className="pr-3 py-1 text-center">Continuity?</th>
                       <th className="pr-3 py-1 text-center">Days</th>
                       <th className="pr-3 py-1 text-center">Paused?</th>
@@ -1858,18 +2202,23 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <tbody>
                     {shiftDefsSorted.map((d) => (
                       <tr key={d.code} className="border-t border-[#F1F5F9]">
-                        <td className="pr-3 py-1.5 font-mono text-[#64748B]">{d.code}</td>
                         <td className="pr-3 py-1.5">
-                          <input
-                            value={d.label || ""}
-                            onChange={(e) => renameShift(d.code, e.target.value)}
-                            placeholder={d.code}
-                            maxLength={4}
-                            className="w-16 border border-[#E4E7EC] rounded px-2 py-1 text-xs font-mono uppercase text-center"
-                          />
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              value={d.label || ""}
+                              onChange={(e) => renameShift(d.code, e.target.value)}
+                              placeholder={d.code}
+                              maxLength={4}
+                              className="w-16 border border-[#E4E7EC] rounded px-2 py-1 text-xs font-mono uppercase text-center"
+                            />
+                            {d.overflow && <span className="text-[9px] uppercase font-bold text-[#7C3AED] border border-[#DDD6FE] rounded px-1.5 py-0.5 whitespace-nowrap" title="The reserved overflow shift — tops up extended-hour staff to their guaranteed shift count. Rename it freely; pause it to turn the top-ups off.">Overflow</span>}
+                          </div>
                         </td>
                         <td className="pr-3 py-1.5 text-center">
                           <input type="checkbox" checked={d.activeWeekend} onChange={() => toggleShiftWeekend(d.code)} />
+                        </td>
+                        <td className="pr-3 py-1.5 text-center">
+                          <input type="checkbox" checked={d.weekendOnly} title="Never appears Monday-Friday — only Saturday, Sunday, and holidays." onChange={() => toggleShiftWeekendOnly(d.code)} />
                         </td>
                         <td className="pr-3 py-1.5 text-center">
                           <input type="checkbox" checked={d.continuityMin != null} onChange={(e) => setShiftContinuity(d.code, e.target.checked)} />
@@ -1891,7 +2240,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                           />
                         </td>
                         <td className="py-1.5">
-                          <button onClick={() => removeShiftDefinition(d.code)} className="text-[#DC2626] text-[10px]">Remove</button>
+                          {d.overflow ? (
+                            <span className="text-[10px] text-[#94A3B8]" title="Reserved — use Paused above to turn off overflow top-ups instead of removing it.">Reserved</span>
+                          ) : (
+                            <button onClick={() => removeShiftDefinition(d.code)} className="text-[#DC2626] text-[10px]">Remove</button>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -2046,7 +2399,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                     <div className="flex items-center gap-2 flex-wrap pl-1">
                       <label className="text-[11px] text-[#64748B]">Trained on (unchecking excludes them from that shift):</label>
                       <div className="flex flex-wrap gap-1.5">
-                        {ALL_SHIFT_CODES.map((s) => {
+                        {trainableShiftCodes.map((s) => {
                           const active = emp.allowedShifts.includes(s);
                           return (
                             <button key={s} onClick={() => toggleEmployeeAllowedShift(emp.id, s)}
@@ -2134,7 +2487,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               </div>
               <div className="text-xs font-semibold text-[#64748B] mb-1">Trained on (locks which shifts they can fill):</div>
               <div className="flex flex-wrap gap-2">
-                {ALL_SHIFT_CODES.map((s) => {
+                {trainableShiftCodes.map((s) => {
                   const active = newExtraShifts.includes(s);
                   return (
                     <button key={s} onClick={() => setNewExtraShifts((prev) => (prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]))}
@@ -2199,7 +2552,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       <div className="flex items-center gap-2 flex-wrap pl-1">
                         <label className="text-[11px] text-[#64748B]">Trained on:</label>
                         <div className="flex flex-wrap gap-1.5">
-                          {ALL_SHIFT_CODES.map((s) => {
+                          {trainableShiftCodes.map((s) => {
                             const active = e.allowedShifts.includes(s);
                             return (
                               <button key={s} onClick={() => toggleEmployeeAllowedShift(e.id, s)}
@@ -2293,6 +2646,43 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
             {schedule.weekendPairingMismatches.length > 0 && (
               <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
                 ℹ {schedule.weekendPairingMismatches.length} weekend(s) couldn't be paired to the same person — nobody permanent was free both days, so it fell back to covering each day separately: {schedule.weekendPairingMismatches.join("; ")}
+              </div>
+            )}
+            {manualEditWarnings.length > 0 && (
+              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2 flex items-start justify-between gap-3">
+                <span>⚠ After your last move: {manualEditWarnings.join(" ")}</span>
+                <button onClick={() => setManualEditWarnings([])} className="text-xs underline whitespace-nowrap">Dismiss</button>
+              </div>
+            )}
+            <div className="bg-[#EFF6FF] border border-[#BFDBFE] text-[#1E3A8A] text-xs rounded px-3 py-2">
+              ✋ Drag any shift cell onto another to swap them by hand — a small teal dot marks a cell you've moved. Fairness Report, Optimization, and Export CSV all update to match. Locked-leave days and continuity shifts can't be dragged onto or moved.
+            </div>
+            {gapsList.length > 0 && (
+              <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
+                <div className="text-sm font-semibold mb-1">Fill a coverage gap</div>
+                <p className="text-xs text-[#64748B] mb-3">Pick who covers each empty shift below — same as a drag-and-drop move, so Fairness Report, Optimization, and Export CSV all update to match. You'll get a warning (not a block) if they're not trained for it or it pushes them over a limit.</p>
+                <div className="space-y-2">
+                  {gapsList.map(({ day, code }) => (
+                    <div key={`${day.idx}-${code}`} className="flex items-center gap-2 flex-wrap text-xs">
+                      <span className="px-2 py-1 rounded font-mono font-semibold text-white min-w-[48px] text-center" style={{ background: getShiftColor(code) }}>{shiftLabel(code)}</span>
+                      <span className="text-[#64748B] w-20">{day.wd} {day.md}</span>
+                      <select
+                        defaultValue=""
+                        onChange={(e) => {
+                          if (!e.target.value) return;
+                          const chosen = [...permanent, ...extra].find((x) => String(x.id) === e.target.value);
+                          if (chosen) applyManualFill(chosen, day.idx, code);
+                        }}
+                        className="border border-[#E4E7EC] rounded px-2 py-1 text-xs"
+                      >
+                        <option value="">Assign to…</option>
+                        {eligibleCandidatesFor(day, code).map((c) => (
+                          <option key={c.id} value={c.id}>{c.name}{c.type === "extra" ? " (PRN)" : ""}{!c.trained ? " — not trained" : ""}</option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
             <div className="flex items-center gap-3 flex-wrap text-xs">

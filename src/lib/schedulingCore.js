@@ -46,15 +46,76 @@ export const shiftPref = (statEntry, shift) => (statEntry.shiftCount[shift] === 
 // candidate may already have LATER days assigned too. A backward-only
 // check misses windows that include those later days, so this scans in
 // both directions and works correctly for both callers.
+// The largest number of worked days found in any windowDays-long span —
+// the real "how loaded is this person right now" number, not just a
+// yes/no over-the-line check. wouldExceedShiftCap below is just this
+// compared against the cap; a live shift-count display can use this
+// directly to show someone their actual current peak.
+export function maxShiftsInAnyWindow(workedDayIndices, windowDays) {
+  let max = 0;
+  for (const anchor of workedDayIndices) {
+    const count = workedDayIndices.filter((idx) => idx >= anchor && idx < anchor + windowDays).length;
+    if (count > max) max = count;
+  }
+  return max;
+}
 export function wouldExceedShiftCap(emp, existingWorkedDayIndices, proposedDayIndices) {
   if (!emp.shiftCap) return false;
-  const { windowDays, maxShifts } = emp.shiftCap;
   const allDays = [...existingWorkedDayIndices, ...proposedDayIndices];
-  for (const anchor of allDays) {
-    const count = allDays.filter((idx) => idx >= anchor && idx < anchor + windowDays).length;
-    if (count > maxShifts) return true;
+  return maxShiftsInAnyWindow(allDays, emp.shiftCap.windowDays) > emp.shiftCap.maxShifts;
+}
+
+// The one reserved shift code that can have more than one person on it
+// the same day — it exists purely to top someone up to their guaranteed
+// shift count without inventing coverage nobody actually needs. Every
+// extra person that day gets their own key (E0, E0#2, E0#3...) so the
+// rest of the app's "one person per shift code per day" assumption never
+// has to change; isOverflowKey/overflowBaseCode are the only two places
+// that need to know the numbered keys all mean the same displayed shift.
+export const OVERFLOW_CODE = "E0";
+export function isOverflowKey(k) {
+  return k === OVERFLOW_CODE || /^E0#\d+$/.test(k);
+}
+export function overflowBaseCode(k) {
+  return isOverflowKey(k) ? OVERFLOW_CODE : k;
+}
+export function nextOverflowKey(dayAssignment) {
+  if (!(OVERFLOW_CODE in dayAssignment)) return OVERFLOW_CODE;
+  let n = 2;
+  while (`${OVERFLOW_CODE}#${n}` in dayAssignment) n++;
+  return `${OVERFLOW_CODE}#${n}`;
+}
+// Which days to top up so an extended-hour employee actually reaches
+// their guaranteed shift count, not just stays under the ceiling.
+// Splits the schedule into consecutive, non-overlapping windowDays-long
+// blocks (the schedule's own [0, totalDays) — the last block may be
+// shorter) rather than a true sliding window: far simpler to reason
+// about and verify, and in practice gives the same real-world result a
+// manager cares about. Within a short block, picks are spread evenly
+// across the available candidate days instead of clumped at one end.
+export function pickOverflowDays(workedDayIndices, candidateIndices, totalDays, windowDays, target) {
+  const worked = new Set(workedDayIndices);
+  const candidates = new Set(candidateIndices);
+  const picks = [];
+  for (let blockStart = 0; blockStart < totalDays; blockStart += windowDays) {
+    const blockEnd = Math.min(blockStart + windowDays, totalDays);
+    const blockCandidates = [];
+    let workedInBlock = 0;
+    for (let idx = blockStart; idx < blockEnd; idx++) {
+      if (worked.has(idx)) workedInBlock++;
+      else if (candidates.has(idx)) blockCandidates.push(idx);
+    }
+    const shortfall = target - workedInBlock;
+    if (shortfall <= 0) continue;
+    const take = Math.min(shortfall, blockCandidates.length);
+    if (take === blockCandidates.length) {
+      picks.push(...blockCandidates);
+    } else {
+      const stride = blockCandidates.length / take;
+      for (let i = 0; i < take; i++) picks.push(blockCandidates[Math.floor(i * stride)]);
+    }
   }
-  return false;
+  return picks;
 }
 // Longest run of back-to-back calendar days in a set of worked-day
 // indices (duplicates and out-of-order input are both fine). Shared by
@@ -192,6 +253,20 @@ export function isOpenWeekend(rotation, weekendIndex) {
   const { cycleWeekends, openOffset } = rotation;
   const mod = ((weekendIndex % cycleWeekends) + cycleWeekends) % cycleWeekends;
   return mod === openOffset;
+}
+// Whether a Friday or Monday sits right next to this employee's OFF
+// weekend, per their rotation — the "extend off-weekends into a long
+// weekend" preference uses this to softly discourage working that
+// adjacent day. Any other day of the week, or no rotation at all, is
+// always false. `epoch` is the same schedule-relative weekend epoch
+// weekendIndexFor uses everywhere else.
+export function isAdjacentToOffWeekend(rotation, date, dow, epoch) {
+  if (!rotation) return false;
+  const offsetDays = dow === 5 ? 1 : dow === 1 ? -2 : null; // Fri -> next Sat; Mon -> previous Sat
+  if (offsetDays === null) return false;
+  const satDate = new Date(date);
+  satDate.setDate(satDate.getDate() + offsetDays);
+  return !isOpenWeekend(rotation, weekendIndexFor(satDate, epoch));
 }
 
 // Maximum bipartite matching via augmenting paths (Kuhn's algorithm).

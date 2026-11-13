@@ -3,6 +3,8 @@
 // (shift code, "PTO-1"/"PTO-2"/"WKND", "OFF", or a trailing "*" for a
 // PTO-2 override) so the download always matches what's on screen.
 
+import { overflowBaseCode } from "./schedulingCore";
+
 function csvEscape(value) {
   const s = String(value ?? "");
   if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
@@ -11,7 +13,7 @@ function csvEscape(value) {
 
 function cellForCsv(employee, day, ptoStatus, ptoSource, key, shiftLabelFn) {
   const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
-  if (entry) return entry[1].override ? `${shiftLabelFn(entry[0])}*` : shiftLabelFn(entry[0]);
+  if (entry) { const code = overflowBaseCode(entry[0]); return entry[1].override ? `${shiftLabelFn(code)}*` : shiftLabelFn(code); }
   const k = key(employee.id, day.idx);
   const st = ptoStatus[k];
   // Same distinction the Schedule tab's grid makes: a weekend blocked by
