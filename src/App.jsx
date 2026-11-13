@@ -1588,11 +1588,21 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // running total. PTO-1 needs no special handling here — worked day
   // indices only ever include a day someone was actually assigned, which
   // a PTO-1 day never is.
+  // `peak` (worst window anywhere in the whole schedule) is what actually
+  // has to stay correct, so it's what drives the cap comparison and the
+  // red flag — total alone can't be safely compared to a per-window cap
+  // (a multi-period schedule's total is naturally a multiple of it, e.g.
+  // 38 total vs a cap of 10 looks alarming but is normal over 8 weeks).
+  // `total` is shown alongside it purely so the number visibly moves on
+  // every drag — peak only drops once ALL windows touching the removed
+  // day fall below the old high-water mark, so it can look "stuck" after
+  // a single edit even though the data changed correctly.
   const shiftTallyFor = (employee) => {
     const worked = workedDayIndicesFromSchedule(schedule.days, employee.id);
-    if (!employee.shiftCap) return { current: worked.length, cap: null, over: false };
-    const current = maxShiftsInAnyWindow(worked, employee.shiftCap.windowDays);
-    return { current, cap: employee.shiftCap.maxShifts, over: current > employee.shiftCap.maxShifts };
+    const total = worked.length;
+    if (!employee.shiftCap) return { total, cap: null, peak: total, over: false };
+    const peak = maxShiftsInAnyWindow(worked, employee.shiftCap.windowDays);
+    return { total, cap: employee.shiftCap.maxShifts, peak, over: peak > employee.shiftCap.maxShifts };
   };
 
   // Every unfilled shift, flattened to one row per (day, code) — feeds
@@ -1619,8 +1629,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       <table className="text-xs border-collapse">
         <thead>
           <tr>
-            <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[46px]" title="Shifts right now vs. their extended-hour cap (or just a running total if they're not capped) — updates live as you drag or fill gaps.">Shifts</th>
-            <th className="sticky left-[46px] bg-white z-10 text-left px-3 py-2 border-b border-[#E4E7EC] min-w-[150px]">Employee</th>
+            <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[56px]" title="Top: worst 14-day stretch anywhere in this schedule vs. their extended-hour cap — this is what turns red, since it's what actually matters for not overworking them. Bottom: their running total for the whole schedule, which moves with every drag (the top number only drops once every window touching the removed day is back under the old high, so it can look unchanged right after a single edit even though it's correct).">Shifts</th>
+            <th className="sticky left-[56px] bg-white z-10 text-left px-3 py-2 border-b border-[#E4E7EC] min-w-[150px]">Employee</th>
             {schedule.days.map((d) => (
               <th key={d.idx} className={`px-1 py-2 border-b border-[#E4E7EC] font-normal text-center min-w-[36px] ${d.isWknd ? "bg-[#F1F5F9]" : ""}`}>
                 <div className="text-[#64748B]">{d.wd[0]}</div><div className="text-[10px]">{d.md}</div>
@@ -1635,13 +1645,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
             return (
             <tr key={emp.id}>
               <td
-                className="sticky left-0 bg-white z-10 px-1 py-1 border-b border-[#F1F5F9] text-center font-semibold"
-                style={{ color: tally.over ? "#DC2626" : "#64748B" }}
-                title={tally.cap != null ? `Peak ${tally.current} shifts in any ${emp.shiftCap.windowDays}-day window, capped at ${tally.cap}` : `${tally.current} shifts total — no cap set`}
+                className="sticky left-0 bg-white z-10 px-1 py-1 border-b border-[#F1F5F9] text-center"
+                title={tally.cap != null
+                  ? `Worst ${emp.shiftCap.windowDays}-day stretch: ${tally.peak} of ${tally.cap}. Running total this schedule: ${tally.total}.`
+                  : `${tally.total} shifts total — no cap set`}
               >
-                {tally.cap != null ? `${tally.current}/${tally.cap}` : tally.current}
+                <div className="font-semibold" style={{ color: tally.over ? "#DC2626" : "#64748B" }}>
+                  {tally.cap != null ? `${tally.peak}/${tally.cap}` : tally.total}
+                </div>
+                {tally.cap != null && <div className="text-[9px] text-[#94A3B8]">{tally.total} tot</div>}
               </td>
-              <td className="sticky left-[46px] bg-white z-10 px-3 py-1 border-b border-[#F1F5F9] font-medium">
+              <td className="sticky left-[56px] bg-white z-10 px-3 py-1 border-b border-[#F1F5F9] font-medium">
                 {emp.name}{emp.type === "extra" && <span className="ml-1 text-[9px] text-[#64748B]">PRN</span>}
               </td>
               {schedule.days.map((d) => {
@@ -1888,7 +1902,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li>Every employee, every day, color-coded by shift.</li>
                   <li>A pulsing red <b>HOLE</b> badge means that shift couldn't be filled — hover it to see which shift and why.</li>
                   <li>An amber banner reading "couldn't be paired to the same person" means weekend pairing (see Permanent Staff above) couldn't find anyone free both Saturday and Sunday for that shift — it's a heads-up, not an error, and it tells you exactly which weekend to check.</li>
-                  <li><b>Shifts column</b> (left of Employee) — their current shift count right now, live. Capped staff show "current/cap" using their actual extended-hour cap, and it turns red if a manual move pushes them over it; uncapped staff just show a running total. It recalculates the instant you drag a cell or fill a gap, so it's your built-in "am I overloading anyone" checkpoint.</li>
+                  <li><b>Shifts column</b> (left of Employee) — two numbers, live, recalculated the instant you drag a cell or fill a gap. The bold top number is their worst 14-day stretch anywhere in the schedule vs. their cap (uncapped staff just show a running total) — this is your real "am I overloading anyone" checkpoint, and it turns red the moment any stretch goes over. The small number underneath is their running total for the whole schedule, which moves up or down with every single edit — the top number can look unchanged right after removing just one shift, since it only drops once every window touching that day is back under the old high; the total is there so you can always see the edit took effect.</li>
                   <li><b>Drag any shift cell onto another to swap them by hand.</b> Both people trade places — nobody just disappears. A small teal dot marks a cell you've moved. Fairness Report, Optimization, and Export CSV all update to match immediately. A continuity shift can't be dragged or dropped onto (it's a locked multi-day block), and neither can someone's approved PTO-1 leave day. If a swap puts someone on a shift they're not trained for or over a limit, you'll get an amber warning — it still goes through, since it's your call, but you'll know.</li>
                   <li>Dragging someone <i>away</i> from a day they were covering, onto a day where the other person wasn't working, leaves their original day empty — that's not a bug. Nobody automatically backfills it, so it shows up honestly as a new Coverage gap instead of silently vanishing.</li>
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
