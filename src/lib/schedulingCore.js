@@ -37,32 +37,32 @@ export const shiftPref = (statEntry, shift) => (statEntry.shiftCount[shift] === 
 // more capped employees, or change the ratio, purely through that data;
 // nothing below needs to change.
 //
-// Checks every window anchored at an actual worked day (existing days
-// plus the day(s) being proposed), not just a single backward-looking
-// window. That matters because callers fall into two different shapes:
-// during initial construction, days are decided strictly in chronological
-// order, so only prior days exist yet and a backward check would suffice
-// — but local search optimizes an already-fully-built schedule, where a
-// candidate may already have LATER days assigned too. A backward-only
-// check misses windows that include those later days, so this scans in
-// both directions and works correctly for both callers.
-// The largest number of worked days found in any windowDays-long span —
-// the real "how loaded is this person right now" number, not just a
-// yes/no over-the-line check. wouldExceedShiftCap below is just this
-// compared against the cap; a live shift-count display can use this
+// The shift cap tracks real pay periods (e.g. 10 worked days every 14-day
+// pay period) — fixed, non-overlapping calendar blocks, not a rolling
+// "any 14 consecutive days" window. Two days 10 apart can land in
+// different pay periods and shouldn't be treated as competing for the
+// same quota just because they're within windowDays of each other; a
+// rolling check also blocks real, payable shifts near a block boundary
+// that a fixed pay period would have no problem with at all. Blocks are
+// anchored to the schedule's own start date (day 0) — the same anchor
+// weekend rotation groups use.
+// The largest number of worked days found in any single pay-period block
+// — the real "how loaded is this person's heaviest period" number, not
+// just a yes/no over-the-line check. wouldExceedShiftCap below is just
+// this compared against the cap; a live shift-count display can use this
 // directly to show someone their actual current peak.
-export function maxShiftsInAnyWindow(workedDayIndices, windowDays) {
-  let max = 0;
-  for (const anchor of workedDayIndices) {
-    const count = workedDayIndices.filter((idx) => idx >= anchor && idx < anchor + windowDays).length;
-    if (count > max) max = count;
-  }
-  return max;
+export function maxShiftsInAnyPayPeriod(workedDayIndices, windowDays) {
+  const counts = {};
+  workedDayIndices.forEach((idx) => {
+    const block = Math.floor(idx / windowDays);
+    counts[block] = (counts[block] || 0) + 1;
+  });
+  return Math.max(0, ...Object.values(counts));
 }
 export function wouldExceedShiftCap(emp, existingWorkedDayIndices, proposedDayIndices) {
   if (!emp.shiftCap) return false;
   const allDays = [...existingWorkedDayIndices, ...proposedDayIndices];
-  return maxShiftsInAnyWindow(allDays, emp.shiftCap.windowDays) > emp.shiftCap.maxShifts;
+  return maxShiftsInAnyPayPeriod(allDays, emp.shiftCap.windowDays) > emp.shiftCap.maxShifts;
 }
 
 // The one reserved shift code that can have more than one person on it
@@ -86,34 +86,38 @@ export function nextOverflowKey(dayAssignment) {
   return `${OVERFLOW_CODE}#${n}`;
 }
 // Which days to top up so an extended-hour employee actually reaches
-// their guaranteed shift count, not just stays under the ceiling.
-// Splits the schedule into consecutive, non-overlapping windowDays-long
-// blocks (the schedule's own [0, totalDays) — the last block may be
-// shorter) rather than a true sliding window: far simpler to reason
-// about and verify, and in practice gives the same real-world result a
-// manager cares about. Within a short block, picks are spread evenly
-// across the available candidate days instead of clumped at one end.
-export function pickOverflowDays(workedDayIndices, candidateIndices, totalDays, windowDays, target) {
-  const worked = new Set(workedDayIndices);
+// their guaranteed shift count for every pay period, not just stays under
+// the ceiling. Pay periods are fixed, non-overlapping windowDays-long
+// blocks anchored to the schedule's start date (see
+// maxShiftsInAnyPayPeriod) — each block is topped up independently, so a
+// shift already sitting in a neighboring period never blocks a pick here.
+// Fills every eligible candidate day up to target, earliest first; picks
+// can land several days in a row right after a gap (e.g. a PTO weekend)
+// instead of staying spread through the block.
+// isAcceptable(dayIdx, runningWorkedDayIndices), if given, is asked before
+// each candidate is counted toward its block's quota — for a check like
+// the consecutive-day hard limit, which depends on exactly which OTHER
+// picks already landed nearby, not just static per-day eligibility. A day
+// it rejects is skipped, not treated as using up the block's quota, so
+// the fill keeps trying later candidates instead of falling short of
+// target just because one specific day didn't work out.
+export function pickOverflowDays(workedDayIndices, candidateIndices, totalDays, windowDays, target, isAcceptable) {
   const candidates = new Set(candidateIndices);
+  const blockCounts = {};
+  const runningWorked = [...workedDayIndices];
+  workedDayIndices.forEach((idx) => {
+    const block = Math.floor(idx / windowDays);
+    blockCounts[block] = (blockCounts[block] || 0) + 1;
+  });
   const picks = [];
-  for (let blockStart = 0; blockStart < totalDays; blockStart += windowDays) {
-    const blockEnd = Math.min(blockStart + windowDays, totalDays);
-    const blockCandidates = [];
-    let workedInBlock = 0;
-    for (let idx = blockStart; idx < blockEnd; idx++) {
-      if (worked.has(idx)) workedInBlock++;
-      else if (candidates.has(idx)) blockCandidates.push(idx);
-    }
-    const shortfall = target - workedInBlock;
-    if (shortfall <= 0) continue;
-    const take = Math.min(shortfall, blockCandidates.length);
-    if (take === blockCandidates.length) {
-      picks.push(...blockCandidates);
-    } else {
-      const stride = blockCandidates.length / take;
-      for (let i = 0; i < take; i++) picks.push(blockCandidates[Math.floor(i * stride)]);
-    }
+  for (let i = 0; i < totalDays; i++) {
+    if (!candidates.has(i)) continue;
+    const block = Math.floor(i / windowDays);
+    if ((blockCounts[block] || 0) >= target) continue;
+    if (isAcceptable && !isAcceptable(i, runningWorked)) continue;
+    runningWorked.push(i);
+    blockCounts[block] = (blockCounts[block] || 0) + 1;
+    picks.push(i);
   }
   return picks;
 }

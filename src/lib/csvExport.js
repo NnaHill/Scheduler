@@ -1,7 +1,8 @@
 // Exports a generated schedule to CSV — one row per employee, one
 // column per day. Mirrors the Schedule tab's cellFor logic exactly
-// (shift code, "PTO-1"/"PTO-2"/"WKND", "OFF", or a trailing "*" for a
-// PTO-2 override) so the download always matches what's on screen.
+// (shift code, "PTO-1"/"PTO-2"/"WKND", "OFF", a trailing "*" for a PTO-2
+// override, or a trailing "!" for a phantom needs-manual-coverage flag)
+// so the download always matches what's on screen.
 
 import { overflowBaseCode } from "./schedulingCore";
 
@@ -13,7 +14,12 @@ function csvEscape(value) {
 
 function cellForCsv(employee, day, ptoStatus, ptoSource, key, shiftLabelFn) {
   const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
-  if (entry) { const code = overflowBaseCode(entry[0]); return entry[1].override ? `${shiftLabelFn(code)}*` : shiftLabelFn(code); }
+  if (entry) {
+    const code = overflowBaseCode(entry[0]);
+    const label = shiftLabelFn(code);
+    if (entry[1].phantom) return `${label}!NEEDS COVERAGE`;
+    return entry[1].override ? `${label}*` : label;
+  }
   const k = key(employee.id, day.idx);
   const st = ptoStatus[k];
   // Same distinction the Schedule tab's grid makes: a weekend blocked by

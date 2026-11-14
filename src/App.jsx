@@ -27,7 +27,7 @@ import {
 } from "./lib/persistence";
 import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
-  wouldExceedShiftCap, maxShiftsInAnyWindow, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
+  wouldExceedShiftCap, maxShiftsInAnyPayPeriod, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
   weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, isAdjacentToOffWeekend, kuhnMatch, partitionRun,
   longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, countBackToBackSameShift, unfilledShifts,
   OVERFLOW_CODE, isOverflowKey, overflowBaseCode, nextOverflowKey, pickOverflowDays,
@@ -1190,14 +1190,9 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     permanent.forEach((emp) => {
       if (!emp.shiftCap) return;
       const { windowDays, maxShifts } = emp.shiftCap;
-      const workedIdx = daysArr.filter((d) => Object.values(d.assignment).some((a) => a.empId === emp.id)).map((d) => d.idx).sort((a, b) => a - b);
-      for (const windowStart of workedIdx) {
-        const countInWindow = workedIdx.filter((idx) => idx >= windowStart && idx < windowStart + windowDays).length;
-        if (countInWindow > maxShifts) {
-          violations.push(`${emp.name}: ${countInWindow} shifts within a ${windowDays}-day span (cap is ${maxShifts})`);
-          break;
-        }
-      }
+      const workedIdx = daysArr.filter((d) => Object.values(d.assignment).some((a) => a.empId === emp.id)).map((d) => d.idx);
+      const peak = maxShiftsInAnyPayPeriod(workedIdx, windowDays);
+      if (peak > maxShifts) violations.push(`${emp.name}: ${peak} shifts in one ${windowDays}-day pay period (cap is ${maxShifts})`);
     });
     return violations;
   };
@@ -1287,8 +1282,14 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const shiftCapViolations = verifyShiftCaps(finalDays);
     const cappedFixedDayViolations = verifyCappedFixedDays(finalDays);
     const weekendPairingMismatches = weekendPairingEnabled ? verifyWeekendPairing(finalDays) : [];
+    // Pay-period shortfalls the guarantee top-up couldn't resolve without
+    // breaking the consecutive-day hard limit — flagged on the grid (the
+    // red "!" badge) rather than silently shipped short. One flag per
+    // unresolved pay period, so this is a direct count of what needs a
+    // manager's manual call.
+    const guaranteeGaps = finalDays.reduce((sum, d) => sum + Object.values(d.assignment).filter((a) => a.phantom).length, 0);
 
-    return { days: finalDays, fairness, extraFairness, totalHoles, totalOverrides, continuityCheck, employeesMissingShifts, shiftCapViolations, cappedFixedDayViolations, weekendPairingMismatches };
+    return { days: finalDays, fairness, extraFairness, totalHoles, totalOverrides, continuityCheck, employeesMissingShifts, shiftCapViolations, cappedFixedDayViolations, weekendPairingMismatches, guaranteeGaps };
   };
 
   // Tops every extended-hour employee up to their guaranteed shift count
@@ -1308,57 +1309,154 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const overflowDef = shiftDefByCode[OVERFLOW_CODE];
     if (!overflowDef || overflowDef.collapsed) return daysIn;
     let days = daysIn;
-    permanent.filter((e) => e.shiftCap).forEach((e) => {
-      const workedDayIndices = workedDayIndicesFromSchedule(days, e.id);
-      const workedSet = new Set(workedDayIndices);
-      const candidateIndices = days
-        .filter((d) => {
-          if (workedSet.has(d.idx)) return false;
-          const st = ptoStatus[key(e.id, d.idx)];
-          if (st === "PTO1" || st === "PTO2") return false;
-          if (!respectsFixedDayRestriction(e, [d.dow])) return false;
-          if (consecutiveHardLimit && wouldExceedConsecutiveDays(workedDayIndices, [d.idx], maxConsecutiveDays)) return false;
-          return true;
-        })
-        .map((d) => d.idx);
-      const roughPicks = pickOverflowDays(workedDayIndices, candidateIndices, days.length, e.shiftCap.windowDays, e.shiftCap.maxShifts);
-      // The floor and the ceiling are the same number, so they can only
-      // disagree right at a block boundary — pickOverflowDays works in
-      // fixed blocks, but wouldExceedShiftCap (same function the ceiling
-      // itself uses) checks every SLIDING window. When they conflict, the
-      // ceiling wins: add picks one at a time, skip any that would push
-      // a sliding window over the cap. Best-effort on the floor near a
-      // boundary beats ever creating real overtime.
-      const picks = [];
-      const runningWorked = [...workedDayIndices];
-      roughPicks.forEach((idx) => {
-        if (wouldExceedShiftCap(e, runningWorked, [idx])) return;
-        picks.push(idx);
-        runningWorked.push(idx);
-      });
-      if (picks.length === 0) return;
-      const pickSet = new Set(picks);
+
+    // A real shift this person is trained for always beats a generic E0
+    // filler, on that same day, two ways at once: it counts toward their
+    // guarantee AND covers actual need instead of padding hours — so
+    // there's no reason to call in (or keep) PRN on a day someone who
+    // needs more hours could cover it directly. Prefer an outright hole
+    // first, then a PRN-covered shift to take over; only fall back to E0
+    // when neither exists.
+    const applyPick = (employee, dayIdx) => {
       days = days.map((d) => {
-        if (!pickSet.has(d.idx)) return d;
-        // A real shift this person is trained for always beats a generic
-        // E0 filler, on that same day, two ways at once: it counts
-        // toward their guarantee AND covers actual need instead of
-        // padding hours — so there's no reason to call in (or keep) PRN
-        // on a day someone who needs more hours could cover it directly.
-        // Prefer an outright hole first, then a PRN-covered shift to
-        // take over; only fall back to E0 when neither exists.
-        const holeCode = d.holes.find((code) => e.allowedShifts.includes(code));
-        const prnEntry = Object.entries(d.assignment).find(([code, info]) => info.type === "extra" && e.allowedShifts.includes(code));
+        if (d.idx !== dayIdx) return d;
+        const holeCode = d.holes.find((code) => employee.allowedShifts.includes(code));
+        const prnEntry = Object.entries(d.assignment).find(([code, info]) => info.type === "extra" && employee.allowedShifts.includes(code));
         const newAssignment = { ...d.assignment };
-        if (holeCode) {
-          newAssignment[holeCode] = { empId: e.id, type: "permanent", override: false, fixed: false };
-        } else if (prnEntry) {
-          newAssignment[prnEntry[0]] = { empId: e.id, type: "permanent", override: false, fixed: false };
-        } else {
-          newAssignment[nextOverflowKey(d.assignment)] = { empId: e.id, type: "permanent", override: false, fixed: false };
-        }
+        if (holeCode) newAssignment[holeCode] = { empId: employee.id, type: "permanent", override: false, fixed: false };
+        else if (prnEntry) newAssignment[prnEntry[0]] = { empId: employee.id, type: "permanent", override: false, fixed: false };
+        else newAssignment[nextOverflowKey(d.assignment)] = { empId: employee.id, type: "permanent", override: false, fixed: false };
         return { ...d, assignment: newAssignment, holes: holesOnDay({ ...d, assignment: newAssignment }) };
       });
+    };
+
+    const blockCandidates = (employee, blockStart, blockEnd) => {
+      const worked = new Set(workedDayIndicesFromSchedule(days, employee.id));
+      return days.slice(blockStart, blockEnd)
+        .filter((d) => {
+          if (worked.has(d.idx)) return false;
+          const st = ptoStatus[key(employee.id, d.idx)];
+          if (st === "PTO1" || st === "PTO2") return false;
+          return respectsFixedDayRestriction(employee, [d.dow]);
+        })
+        .map((d) => d.idx);
+    };
+
+    // Fills just this one pay-period block up to target, same acceptance
+    // rules as the main pass. Reused both for the initial top-up and to
+    // recover a block that the run-reshaping repair below just took a day
+    // away from.
+    const topUpBlock = (employee, blockStart, windowDays, maxShifts) => {
+      const blockEnd = Math.min(blockStart + windowDays, days.length);
+      const worked = workedDayIndicesFromSchedule(days, employee.id);
+      if (worked.filter((idx) => idx >= blockStart && idx < blockEnd).length >= maxShifts) return;
+      const picks = pickOverflowDays(
+        worked, blockCandidates(employee, blockStart, blockEnd), days.length, windowDays, maxShifts,
+        (idx, runningWorked) => !wouldExceedShiftCap(employee, runningWorked, [idx])
+          && !(consecutiveHardLimit && wouldExceedConsecutiveDays(runningWorked, [idx], maxConsecutiveDays))
+      );
+      picks.forEach((idx) => applyPick(employee, idx));
+    };
+
+    // Someone other than `employee` who could safely take over `code` on
+    // `dayIdx` instead — trained, available, and (if capped themselves)
+    // wouldn't bust their OWN pay-period cap or consecutive-day limit by
+    // taking it. Permanent staff first; PRN is still a fallback since
+    // displacing them to free up a guaranteed-hours day is the same trade
+    // the normal top-up already makes.
+    const findReplacement = (employee, dayIdx, code) => {
+      const day = days.find((d) => d.idx === dayIdx);
+      const used = new Set(Object.values(day.assignment).map((a) => a.empId));
+      const perm = permanent.find((p) => p.id !== employee.id && !used.has(p.id) && p.allowedShifts.includes(code)
+        && ptoStatus[key(p.id, dayIdx)] !== "PTO1" && ptoStatus[key(p.id, dayIdx)] !== "PTO2"
+        && respectsFixedDayRestriction(p, [day.dow])
+        && !wouldExceedShiftCap(p, workedDayIndicesFromSchedule(days, p.id), [dayIdx])
+        && !(consecutiveHardLimit && wouldExceedConsecutiveDays(workedDayIndicesFromSchedule(days, p.id), [dayIdx], maxConsecutiveDays)));
+      if (perm) return { empId: perm.id, type: "permanent" };
+      const ex = extra.find((x) => !used.has(x.id) && x.allowedShifts.includes(code) && extraAvailable[key(x.id, dayIdx)]);
+      return ex ? { empId: ex.id, type: "extra" } : null;
+    };
+
+    permanent.filter((e) => e.shiftCap).forEach((e) => {
+      const { windowDays, maxShifts } = e.shiftCap;
+      for (let b = 0; b < days.length; b += windowDays) topUpBlock(e, b, windowDays, maxShifts);
+
+      // Anything still short at this point was blocked purely by the
+      // consecutive-day hard limit — not enough open days to add more
+      // without a run forming that's too long. Reshape the run instead of
+      // giving up on the shortfall: hand ONE of this employee's own days
+      // within that run to someone else who can safely take it, then
+      // retry the blocked day. If that leaves the donated day's own block
+      // short, top it back up the same way before moving on.
+      if (consecutiveHardLimit) {
+        for (let b = 0; b < days.length; b += windowDays) {
+          const blockEnd = Math.min(b + windowDays, days.length);
+          let worked = workedDayIndicesFromSchedule(days, e.id);
+          let count = worked.filter((idx) => idx >= b && idx < blockEnd).length;
+          if (count >= maxShifts) continue;
+          for (const dayIdx of blockCandidates(e, b, blockEnd)) {
+            if (count >= maxShifts) break;
+            if (!wouldExceedConsecutiveDays(worked, [dayIdx], maxConsecutiveDays)) continue; // not actually blocked
+            const sorted = [...worked, dayIdx].sort((x, y) => x - y);
+            const at = sorted.indexOf(dayIdx);
+            let lo = at, hi = at;
+            while (lo > 0 && sorted[lo - 1] === sorted[lo] - 1) lo--;
+            while (hi < sorted.length - 1 && sorted[hi + 1] === sorted[hi] + 1) hi++;
+            // A pivot has to come from a DIFFERENT pay-period block than
+            // the one we're trying to fill — donating a day from inside
+            // this same block just moves which day counts toward it, not
+            // how many do.
+            const runDays = sorted.slice(lo, hi + 1).filter((idx) => idx !== dayIdx && (idx < b || idx >= blockEnd));
+            for (const pivotIdx of runDays) {
+              if (wouldExceedConsecutiveDays(worked.filter((idx) => idx !== pivotIdx), [dayIdx], maxConsecutiveDays)) continue;
+              const pivotDay = days.find((d) => d.idx === pivotIdx);
+              const pivotEntry = Object.entries(pivotDay.assignment).find(([, info]) => info.empId === e.id);
+              // Never touch a continuity/weekend-pairing commitment (fixed),
+              // and never hand off a continuity-code shift at all even if
+              // this one instance isn't marked fixed — giving the
+              // replacement just this one day would itself be a fresh
+              // continuity-run violation (that code needs 2-3 days in a
+              // row, not a lone day from whoever picks it up).
+              if (!pivotEntry || pivotEntry[1].fixed || isContinuityCode(pivotEntry[0])) continue;
+              const replacement = findReplacement(e, pivotIdx, pivotEntry[0]);
+              if (!replacement) continue;
+              days = days.map((d) => {
+                if (d.idx !== pivotIdx) return d;
+                const na = { ...d.assignment };
+                na[pivotEntry[0]] = { empId: replacement.empId, type: replacement.type, override: false, fixed: false };
+                return { ...d, assignment: na, holes: holesOnDay({ ...d, assignment: na }) };
+              });
+              applyPick(e, dayIdx);
+              topUpBlock(e, Math.floor(pivotIdx / windowDays) * windowDays, windowDays, maxShifts);
+              worked = workedDayIndicesFromSchedule(days, e.id);
+              count = worked.filter((idx) => idx >= b && idx < blockEnd).length;
+              break;
+            }
+          }
+        }
+      }
+
+      // Whatever's STILL short is a genuine conflict between hard rules —
+      // usually the consecutive-day limit colliding with a fixed
+      // commitment (weekend pairing, continuity) sitting right at a
+      // pay-period boundary — that can't be resolved without relaxing one
+      // of them. Flag it rather than silently shipping an incomplete
+      // guarantee: mark one open day in that period as needing manual
+      // coverage. It counts toward the displayed total, same as a real
+      // pick, so the shortfall is visible in the Shifts column instead of
+      // just quietly missing.
+      for (let b = 0; b < days.length; b += windowDays) {
+        const blockEnd = Math.min(b + windowDays, days.length);
+        const worked = workedDayIndicesFromSchedule(days, e.id);
+        if (worked.filter((idx) => idx >= b && idx < blockEnd).length >= maxShifts) continue;
+        const openDay = blockCandidates(e, b, blockEnd)[0];
+        if (openDay == null) continue;
+        days = days.map((d) => {
+          if (d.idx !== openDay) return d;
+          const newAssignment = { ...d.assignment, [nextOverflowKey(d.assignment)]: { empId: e.id, type: "permanent", override: false, fixed: false, phantom: true } };
+          return { ...d, assignment: newAssignment, holes: holesOnDay({ ...d, assignment: newAssignment }) };
+        });
+      }
     });
     return days;
   };
@@ -1479,6 +1577,25 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     return warnings;
   };
 
+  // Someone other than `excludeEmpId` who could safely take over `code`
+  // on `dayIdx` instead — same checks a generated schedule itself would
+  // apply: trained, available, not already working that day, and (if
+  // capped) safe on pay-period cap and the consecutive-day limit. Used
+  // to backfill the slot a drag just vacated, not to assign the drag's
+  // destination (that's still exactly what the manager dropped).
+  const findReplacementForSlot = (workingDays, dayIdx, code, excludeEmpId) => {
+    const day = workingDays[dayIdx];
+    const used = new Set(Object.values(day.assignment).map((a) => a.empId));
+    const perm = permanent.find((p) => p.id !== excludeEmpId && !used.has(p.id) && p.allowedShifts.includes(code)
+      && ptoStatus[key(p.id, dayIdx)] !== "PTO1" && ptoStatus[key(p.id, dayIdx)] !== "PTO2"
+      && respectsFixedDayRestriction(p, [day.dow])
+      && !wouldExceedShiftCap(p, workedDayIndicesFromSchedule(workingDays, p.id), [dayIdx])
+      && !(consecutiveHardLimit && wouldExceedConsecutiveDays(workedDayIndicesFromSchedule(workingDays, p.id), [dayIdx], maxConsecutiveDays)));
+    if (perm) return { empId: perm.id, type: "permanent" };
+    const ex = extra.find((x) => x.id !== excludeEmpId && !used.has(x.id) && x.allowedShifts.includes(code) && extraAvailable[key(x.id, dayIdx)]);
+    return ex ? { empId: ex.id, type: "extra" } : null;
+  };
+
   // Shared tail for every manual edit (swap or fill): rebuild every report
   // from the edited day array and log it the same way generate() does.
   // One place, so a future third kind of manual edit gets this for free.
@@ -1515,6 +1632,23 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       if (codeB) delete dayB.assignment[codeB];
       if (codeB) dayA.assignment[codeB] = { empId: empA.id, type: empA.type, override: false, fixed: false, manual: true };
       if (codeA) dayB.assignment[codeA] = { empId: empB.id, type: empB.type, override: false, fixed: false, manual: true };
+
+      // Dragging onto someone who wasn't working that day moves a shift
+      // rather than trading one, so the source slot is now empty. Fill
+      // it right away with whoever can safely take it, so the grid
+      // never has to show a fresh hole just because one shift moved —
+      // left as a real hole (for the "Fill a coverage gap" card) only
+      // when nobody safe is free.
+      if (dayIdxA !== dayIdxB) {
+        if (codeA && !codeB) {
+          const replacement = findReplacementForSlot(workingDays, dayIdxA, codeA, empA.id);
+          if (replacement) dayA.assignment[codeA] = { ...replacement, override: false, fixed: false, manual: true };
+        }
+        if (codeB && !codeA) {
+          const replacement = findReplacementForSlot(workingDays, dayIdxB, codeB, empB.id);
+          if (replacement) dayB.assignment[codeB] = { ...replacement, override: false, fixed: false, manual: true };
+        }
+      }
       dayA.holes = holesOnDay(dayA);
       dayB.holes = holesOnDay(dayB);
 
@@ -1567,7 +1701,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
   const cellFor = (employee, day) => {
     const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
-    if (entry) return { code: overflowBaseCode(entry[0]), override: entry[1].override, manual: entry[1].manual };
+    if (entry) return { code: overflowBaseCode(entry[0]), override: entry[1].override, manual: entry[1].manual, phantom: entry[1].phantom };
     const k = key(employee.id, day.idx);
     const st = ptoStatus[k];
     // A weekend blocked off by their rotation cycle isn't the same thing
@@ -1601,8 +1735,18 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const worked = workedDayIndicesFromSchedule(schedule.days, employee.id);
     const total = worked.length;
     if (!employee.shiftCap) return { total, cap: null, peak: total, over: false };
-    const peak = maxShiftsInAnyWindow(worked, employee.shiftCap.windowDays);
-    return { total, cap: employee.shiftCap.maxShifts, peak, over: peak > employee.shiftCap.maxShifts };
+    const { windowDays, maxShifts } = employee.shiftCap;
+    const peak = maxShiftsInAnyPayPeriod(worked, windowDays);
+    // What's actually reachable isn't a flat cap × periods — PTO-1 (including
+    // days auto-blocked by weekend rotation) removes candidate days, which
+    // forces the remaining ones closer together. Run the same fill the
+    // generator uses, from a clean slate, to get this employee's true
+    // achievable max so the denominator never shows an unreachable number.
+    const candidateIndices = schedule.days
+      .filter((d) => ptoStatus[key(employee.id, d.idx)] !== "PTO1")
+      .map((d) => d.idx);
+    const scaledCap = pickOverflowDays([], candidateIndices, schedule.days.length, windowDays, maxShifts).length;
+    return { total, cap: scaledCap, peak, over: peak > maxShifts };
   };
 
   // Every unfilled shift, flattened to one row per (day, code) — feeds
@@ -1629,7 +1773,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       <table className="text-xs border-collapse">
         <thead>
           <tr>
-            <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[56px]" title="Top: their running total for the whole schedule — moves up or down immediately with every drag or gap fill, so swapping two people always moves both numbers at once. Bottom: their extended-hour cap, for reference. Turns red if their worst stretch anywhere in the schedule actually goes over that cap — hover for the exact number.">Shifts</th>
+            <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[56px]" title="Running total for the whole schedule over their extended-hour cap, scaled up to the full schedule length. Moves up or down immediately with every drag or gap fill, so swapping two people always moves both numbers at once. Turns red if any single pay period actually goes over the cap — hover for the exact numbers.">Shifts</th>
             <th className="sticky left-[56px] bg-white z-10 text-left px-3 py-2 border-b border-[#E4E7EC] min-w-[150px]">Employee</th>
             {schedule.days.map((d) => (
               <th key={d.idx} className={`px-1 py-2 border-b border-[#E4E7EC] font-normal text-center min-w-[36px] ${d.isWknd ? "bg-[#F1F5F9]" : ""}`}>
@@ -1645,21 +1789,19 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
             return (
             <tr key={emp.id}>
               <td
-                className="sticky left-0 bg-white z-10 px-1 py-1 border-b border-[#F1F5F9] text-center"
+                className="sticky left-0 bg-white z-10 px-1 py-1 border-b border-[#F1F5F9] text-center font-semibold"
+                style={{ color: tally.over ? "#DC2626" : "#64748B" }}
                 title={tally.cap != null
-                  ? `Running total this schedule: ${tally.total}. Worst ${emp.shiftCap.windowDays}-day stretch: ${tally.peak} of ${tally.cap}.`
+                  ? `Running total this schedule: ${tally.total} of ${tally.cap}. Heaviest ${emp.shiftCap.windowDays}-day pay period: ${tally.peak} of ${emp.shiftCap.maxShifts}.`
                   : `${tally.total} shifts total — no cap set`}
               >
-                <div className="font-semibold" style={{ color: tally.over ? "#DC2626" : "#64748B" }}>
-                  {tally.total}
-                </div>
-                {tally.cap != null && <div className="text-[9px] text-[#94A3B8]">cap {tally.cap}/{emp.shiftCap.windowDays}d</div>}
+                {tally.cap != null ? `${tally.total}/${tally.cap}` : tally.total}
               </td>
               <td className="sticky left-[56px] bg-white z-10 px-3 py-1 border-b border-[#F1F5F9] font-medium">
                 {emp.name}{emp.type === "extra" && <span className="ml-1 text-[9px] text-[#64748B]">PRN</span>}
               </td>
               {schedule.days.map((d) => {
-                const { code, override, manual } = cellFor(emp, d);
+                const { code, override, manual, phantom } = cellFor(emp, d);
                 const isShift = ALL_SHIFT_CODES.includes(code);
                 const displayText = code === "OFF" ? "" : isShift ? shiftLabel(code) : code;
                 const bg = isShift ? getShiftColor(code) : (code === "PTO-1" || code === "WKND") ? "#DC2626" : code === "PTO-2" ? "#F59E0B" : code === "OFF" ? "#E4E7EC" : "transparent";
@@ -1669,13 +1811,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 return (
                   <td key={d.idx} className="border-b border-[#F1F5F9] p-0.5 text-center">
                     <div
-                      className="relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"
+                      className={phantom ? "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold animate-pulse" : "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"}
                       style={{
                         background: bg, color: fg, fontSize: gridCellFontSize(displayText),
-                        border: override ? "2px dashed #F59E0B" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none",
+                        border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none",
                         cursor: draggable ? "grab" : droppable ? "copy" : "default",
                       }}
-                      title={code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
+                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
                       draggable={draggable}
                       onDragStart={draggable ? (e) => { e.dataTransfer.setData("application/json", JSON.stringify({ empId: emp.id, dayIdx: d.idx })); e.dataTransfer.effectAllowed = "move"; } : undefined}
                       onDragOver={droppable ? (e) => e.preventDefault() : undefined}
@@ -1691,6 +1833,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                     >
                       {displayText}{override ? "*" : ""}
                       {manual && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[#0D9488] border border-white" />}
+                      {phantom && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#DC2626] border border-white text-white text-[8px] leading-3 font-bold">!</span>}
                     </div>
                   </td>
                 );
@@ -1902,7 +2045,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li>Every employee, every day, color-coded by shift.</li>
                   <li>A pulsing red <b>HOLE</b> badge means that shift couldn't be filled — hover it to see which shift and why.</li>
                   <li>An amber banner reading "couldn't be paired to the same person" means weekend pairing (see Permanent Staff above) couldn't find anyone free both Saturday and Sunday for that shift — it's a heads-up, not an error, and it tells you exactly which weekend to check.</li>
-                  <li><b>Shifts column</b> (left of Employee) — the bold top number is their running total for the whole schedule, live. Swap two people's shifts and both numbers move at once — one up, one down. The small number underneath is their extended-hour cap, for reference. It turns red if their worst stretch anywhere in the schedule actually goes over that cap (hover the cell for the exact numbers) — that's your real "am I overloading anyone" checkpoint, separate from the total just ticking up or down.</li>
+                  <li><b>Shifts column</b> (left of Employee) — shows their running total for the whole schedule over their extended-hour cap (scaled up to the schedule's full length), live. Swap two people's shifts and both numbers move at once — one up, one down. It turns red if any single pay period actually goes over the cap (hover the cell for the exact numbers) — that's your real "am I overloading anyone" checkpoint, separate from the total just ticking up or down.</li>
                   <li><b>Drag any shift cell onto another to swap them by hand.</b> Both people trade places — nobody just disappears. A small teal dot marks a cell you've moved. Fairness Report, Optimization, and Export CSV all update to match immediately. A continuity shift can't be dragged or dropped onto (it's a locked multi-day block), and neither can someone's approved PTO-1 leave day. If a swap puts someone on a shift they're not trained for or over a limit, you'll get an amber warning — it still goes through, since it's your call, but you'll know.</li>
                   <li>Dragging someone <i>away</i> from a day they were covering, onto a day where the other person wasn't working, leaves their original day empty — that's not a bug. Nobody automatically backfills it, so it shows up honestly as a new Coverage gap instead of silently vanishing.</li>
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
@@ -2655,6 +2798,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
             {schedule.employeesMissingShifts > 0 && (
               <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
                 ℹ {schedule.employeesMissingShifts} employee(s) didn't get at least one of every active shift type this rotation — see Fairness Report for details.
+              </div>
+            )}
+            {schedule.guaranteeGaps > 0 && (
+              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
+                ⚠ {schedule.guaranteeGaps} pay period(s) are short of the guaranteed shift count — every safe day would break the consecutive-day limit, usually because a weekend-paired or continuity day sits right at the pay-period boundary. Flagged on the grid with a red "!" — assign by hand or relax the consecutive-day limit.
               </div>
             )}
             {schedule.weekendPairingMismatches.length > 0 && (

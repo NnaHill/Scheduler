@@ -7,7 +7,7 @@ import {
   shiftPref,
   NEVER_WORKED_BONUS,
   wouldExceedShiftCap,
-  maxShiftsInAnyWindow,
+  maxShiftsInAnyPayPeriod,
   isOverflowKey,
   overflowBaseCode,
   nextOverflowKey,
@@ -97,34 +97,41 @@ describe("wouldExceedShiftCap", () => {
     expect(wouldExceedShiftCap({ shiftCap: null }, [1, 2, 3], [4])).toBe(false);
   });
   test("exactly at the cap does not exceed", () => {
-    // days 0,1,2 within a 14-day window, cap of 3 — adding a 4th 3 days later exceeds
+    // days 0,1,2 all fall in the first 14-day pay period (block 0), cap of 3
     expect(wouldExceedShiftCap(cap(14, 3), [0, 1], [2])).toBe(false);
   });
-  test("exceeding via only prior days is caught (construction-time shape)", () => {
-    expect(wouldExceedShiftCap(cap(14, 1), [5], [15])).toBe(true); // 5 and 15 are 10 days apart, same 14-day window
+  test("two days in the same fixed pay period count together regardless of order", () => {
+    // days 14 and 20 both fall in block 1 (days 14-27) — it doesn't matter
+    // which one is "existing" and which is "proposed".
+    expect(wouldExceedShiftCap(cap(14, 1), [20], [14])).toBe(true);
+    expect(wouldExceedShiftCap(cap(14, 1), [14], [20])).toBe(true);
   });
-  test("exceeding via a LATER existing day is caught — the case a backward-only check would miss", () => {
-    // existing day 20 comes AFTER the proposed day 15; a check that only looks
-    // backward from 15 would see nothing and wrongly allow this. This is the
-    // exact shape of bug once found in local search, which optimizes an
-    // already-fully-built schedule where later days can already be assigned.
-    expect(wouldExceedShiftCap(cap(14, 1), [20], [15])).toBe(true);
+  test("days 10 apart but in different pay periods don't compete for the same quota", () => {
+    // day 5 is in block 0 (days 0-13), day 15 is in block 1 (days 14-27) —
+    // a rolling 14-day window would flag this, but they're different pay
+    // periods, so this must NOT exceed.
+    expect(wouldExceedShiftCap(cap(14, 1), [5], [15])).toBe(false);
   });
-  test("days far enough apart to never share a window do not exceed", () => {
-    expect(wouldExceedShiftCap(cap(14, 1), [0], [20])).toBe(false);
+  test("days in different pay periods never exceed, no matter how close to a boundary", () => {
+    expect(wouldExceedShiftCap(cap(14, 1), [13], [14])).toBe(false); // adjacent days, different blocks
   });
 });
 
-describe("maxShiftsInAnyWindow", () => {
+describe("maxShiftsInAnyPayPeriod", () => {
   test("no worked days has no peak", () => {
-    expect(maxShiftsInAnyWindow([], 14)).toBe(0);
+    expect(maxShiftsInAnyPayPeriod([], 14)).toBe(0);
   });
-  test("three days clustered inside one window peak at 3", () => {
-    expect(maxShiftsInAnyWindow([0, 1, 2], 14)).toBe(3);
+  test("three days clustered inside one pay period peak at 3", () => {
+    expect(maxShiftsInAnyPayPeriod([0, 1, 2], 14)).toBe(3);
   });
-  test("days spread across two separate windows peak at the denser one", () => {
-    // 0,1,2 are within 14 days of each other; day 30 is its own window
-    expect(maxShiftsInAnyWindow([0, 1, 2, 30], 14)).toBe(3);
+  test("days spread across two separate pay periods peak at the denser one", () => {
+    expect(maxShiftsInAnyPayPeriod([0, 1, 2, 30], 14)).toBe(3);
+  });
+  test("a fixed pay period, not a rolling window — adjacent days across a block boundary don't stack", () => {
+    // day 13 is the last day of block 0, day 14 is the first day of block
+    // 1 — they're one day apart but in different pay periods, so neither
+    // block's count goes above 1.
+    expect(maxShiftsInAnyPayPeriod([13, 14], 14)).toBe(1);
   });
 });
 
@@ -166,10 +173,56 @@ describe("pickOverflowDays", () => {
     const candidates = [14, 15, 16];
     expect(pickOverflowDays(worked, candidates, 28, 14, 3)).toEqual([14, 15, 16]);
   });
-  test("picks spread across the available candidates rather than clumping", () => {
+  test("fills as early as possible, reaching the target in one run", () => {
     const picks = pickOverflowDays([], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 14, 14, 3);
-    expect(picks).toHaveLength(3);
-    expect(Math.max(...picks) - Math.min(...picks)).toBeGreaterThan(3); // not all adjacent
+    expect(picks).toEqual([0, 1, 2]);
+  });
+  test("a gap of ineligible days (e.g. PTO) is recovered right after it, not split evenly", () => {
+    // Days 0-1 are off (not candidates); reaching target 10 in a 14-day
+    // window means working every remaining day, back to back.
+    const candidates = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    expect(pickOverflowDays([], candidates, 14, 14, 10)).toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+  });
+  test("reaches the full target in every fixed pay period, even with a forced gap in one of them", () => {
+    // Off-weekend PTO lands in two different pay periods (days 5-6 in
+    // block 0, days 33-34 in block 2) but each period is topped up
+    // independently, so every one of the 4 periods still hits its own 10.
+    const totalDays = 56, windowDays = 14, target = 10;
+    const pto1 = new Set([5, 6, 33, 34]);
+    const candidates = [];
+    for (let i = 0; i < totalDays; i++) if (!pto1.has(i)) candidates.push(i);
+    const picks = pickOverflowDays([], candidates, totalDays, windowDays, target);
+    expect(picks).toHaveLength(40);
+    expect(maxShiftsInAnyPayPeriod(picks, windowDays)).toBe(target);
+  });
+  test("rejects a pick once its pay period is already full, even from days worked elsewhere in it", () => {
+    // Days 18-27 are already worked (10 of them, all in block 1 / days
+    // 14-27 — that period is already full). Days 16 and 17 fall in the
+    // same block, so they're rejected regardless of where in the block
+    // the existing work came from.
+    const worked = [18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+    const picks = pickOverflowDays(worked, [16, 17], 28, 14, 10);
+    expect(picks).toEqual([]);
+  });
+  test("when isAcceptable rejects a candidate, it keeps trying later ones instead of giving up on the block", () => {
+    // Days 0,1,2 are worked; days 5,6,7 are worked. Candidates 3,4,9 could
+    // close the gap to reach a target of 10, but accepting BOTH 3 and 4
+    // would bridge 0-7 into an 8-day run, over a 6-day limit. A predicate
+    // that rejects day 4 for that reason shouldn't stop the fill short —
+    // it should fall through to day 9 and still hit target.
+    const worked = [0, 1, 2, 5, 6, 7, 10, 11];
+    const isAcceptable = (idx, running) => {
+      const test = [...running, idx].sort((a, b) => a - b);
+      let longest = 1, cur = 1;
+      for (let i = 1; i < test.length; i++) {
+        cur = test[i] === test[i - 1] + 1 ? cur + 1 : 1;
+        longest = Math.max(longest, cur);
+      }
+      return longest <= 6;
+    };
+    const picks = pickOverflowDays(worked, [3, 4, 9], 56, 14, 10, isAcceptable);
+    expect(picks).toEqual([3, 9]); // 4 skipped (would make an 8-day run), 9 used instead
+    expect(worked.length + picks.length).toBe(10); // target still reached
   });
 });
 
