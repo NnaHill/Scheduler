@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import {
   fetchEmployees,
   insertEmployee,
@@ -13,6 +13,9 @@ import {
   bulkUpsertPtoStatus,
   bulkDeletePtoStatus,
   clearPtoStatusForDates,
+  fetchForcedHolidayWork,
+  bulkUpsertForcedHolidayWork,
+  bulkDeleteForcedHolidayWork,
   fetchExtraAvailability,
   addExtraAvailabilityRow,
   removeExtraAvailabilityRow,
@@ -27,10 +30,11 @@ import {
 } from "./lib/persistence";
 import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
-  wouldExceedShiftCap, maxShiftsInAnyPayPeriod, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
+  wouldExceedShiftCap, maxShiftsInAnyPayPeriod, guaranteeTargetForBlock, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
   weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, isAdjacentToOffWeekend, kuhnMatch, partitionRun,
   longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, countBackToBackSameShift, unfilledShifts,
   OVERFLOW_CODE, isOverflowKey, overflowBaseCode, nextOverflowKey, pickOverflowDays, pickPhantomCushionSlot, pickPhantomPermanentSwap, pickPhantomAnySteal,
+  pickForcedHolidayCode,
 } from "./lib/schedulingCore";
 import { buildFeasibilityReport } from "./lib/feasibility";
 import { buildOptimizationTips } from "./lib/optimizationTips";
@@ -93,6 +97,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [employees, setEmployees] = useState([]);
   const [ptoStatus, setPtoStatus] = useState({});
   const [ptoSource, setPtoSource] = useState({}); // key -> 'manual' | 'weekend_rotation'
+  const [forcedHolidayWork, setForcedHolidayWork] = useState({}); // key -> true, the opposite of PTO: must be scheduled a real shift
   const [extraAvailable, setExtraAvailable] = useState({});
   const [holidays, setHolidays] = useState(new Set());
   const [holidayInput, setHolidayInput] = useState("");
@@ -108,6 +113,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [leaveStart, setLeaveStart] = useState("");
   const [leaveEnd, setLeaveEnd] = useState("");
   const [leaveType, setLeaveType] = useState("PTO1");
+  const [leaveWarning, setLeaveWarning] = useState(null);
   // Whose data is currently loaded/edited. Defaults to (and, for a
   // regular manager, always stays) your own account. An admin can
   // switch this to a specific manager's ID to view and edit their
@@ -116,6 +122,23 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [viewingOwnerId, setViewingOwnerId] = useState(session.user.id);
   const [allProfiles, setAllProfiles] = useState([]);
   const reportSyncError = (err) => { console.error(err); setSyncError(err.message || String(err)); };
+
+  // Per-cell write queue for the PTO grid's click-to-cycle — a cell's
+  // status now spans TWO tables (pto_status, forced_holiday_work), so a
+  // transition's writes have to land in the same order the clicks
+  // happened in, or a fast double-click could have a stale write from
+  // an earlier state complete after a later one and leave the two
+  // tables disagreeing (e.g. a cell showing both PTO-1 and forced).
+  // Chaining each cell's writes onto its own promise guarantees that
+  // ordering regardless of network timing, without blocking the UI —
+  // local state still updates instantly on every click.
+  const ptoWriteQueue = useRef({});
+  const queueCellWrite = (k, fn) => {
+    const prev = ptoWriteQueue.current[k] || Promise.resolve();
+    const next = prev.then(fn).catch(reportSyncError);
+    ptoWriteQueue.current[k] = next;
+    return next;
+  };
 
   // Admin-only: the list of every account, to power the "viewing as"
   // switcher. RLS means this silently returns just your own row if
@@ -214,6 +237,22 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // matter what start date is picked.
   const weekendEpoch = useMemo(() => scheduleWeekendEpoch(days), [days]);
 
+  // wouldExceedShiftCap's perBlockCap for a given capped employee —
+  // their PTO-reduced guarantee target, used as the actual ceiling
+  // during matching and local search, not just the floor the top-up
+  // pass fills to. Without this, an employee with approved PTO-1 could
+  // still get scheduled up to their full flat cap from the main
+  // matching pass (which has no idea PTO should shrink anything), then
+  // never get trimmed back down — the guarantee only ever adds shifts,
+  // it was never meant to remove ones matching already gave out.
+  // Always ≤ the flat cap, so this can only tighten things, never let
+  // anyone past their real cap.
+  const capForBlock = (emp) => {
+    if (!emp.shiftCap) return undefined;
+    const { windowDays, maxShifts } = emp.shiftCap;
+    return (blockIndex) => guaranteeTargetForBlock(ptoStatus, ptoSource, emp.id, blockIndex * windowDays, blockIndex * windowDays + windowDays, maxShifts);
+  };
+
   // Whether working this day would cut into an employee's off-weekend —
   // the "extend off-weekends into a long weekend" preference uses this to
   // softly discourage it. Only for someone on a weekend rotation, only
@@ -237,7 +276,12 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         const startIso = days[0].iso;
         const endIso = days[days.length - 1].iso;
         const isoToIdx = new Map(days.map((d) => [d.iso, d.idx]));
+        // forced_holiday_work is a newer table that needs its own migration
+        // run — fetched separately, defaulting to empty on failure (e.g.
+        // the migration hasn't been run yet), so a missing table there
+        // can never take down PTO/availability loading along with it.
         const [ptoRows, availRows] = await Promise.all([fetchPtoStatus(startIso, endIso, viewingOwnerId), fetchExtraAvailability(startIso, endIso, viewingOwnerId)]);
+        const forcedRows = await fetchForcedHolidayWork(startIso, endIso, viewingOwnerId).catch((err) => { reportSyncError(err); return []; });
         if (cancelled) return;
         const nextPto = {};
         const nextPtoSource = {};
@@ -249,9 +293,12 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         });
         const nextAvail = {};
         availRows.forEach((r) => { const idx = isoToIdx.get(r.day_iso); if (idx !== undefined) nextAvail[key(r.employee_id, idx)] = true; });
+        const nextForced = {};
+        forcedRows.forEach((r) => { const idx = isoToIdx.get(r.day_iso); if (idx !== undefined) nextForced[key(r.employee_id, idx)] = true; });
         setPtoStatus(nextPto);
         setPtoSource(nextPtoSource);
         setExtraAvailable(nextAvail);
+        setForcedHolidayWork(nextForced);
       } catch (err) {
         if (!cancelled) reportSyncError(err);
       }
@@ -470,13 +517,47 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       clearPtoStatusForDates(empId, isoList, "weekend_rotation", viewingOwnerId).catch(reportSyncError);
     });
   };
-  // Bulk block/clear a date range as either PTO-1 (hard) or PTO-2 (soft/DNS),
-  // per the leaveType toggle — for extended absences or DNS stretches,
-  // instead of clicking each day.
+  // Bulk block/clear a date range as PTO-1 (hard), PTO-2 (soft/DNS), or a
+  // FORCED holiday-work tag, per the leaveType toggle — for extended
+  // absences, DNS stretches, or a run of mandatory holidays, instead of
+  // clicking each day.
   const blockLeave = (empId) => {
     if (!leaveStart || !leaveEnd || leaveStart > leaveEnd) return;
     const affected = days.filter((d) => d.iso >= leaveStart && d.iso <= leaveEnd);
     if (affected.length === 0) return;
+    const emp = permanent.find((p) => p.id === empId);
+    if (leaveType === "FORCED") {
+      // A forced-work tag only ever makes sense where approved PTO-1
+      // doesn't already block the day — the generator skips a forced day
+      // that collides with PTO-1 rather than silently overriding
+      // approved leave, so flag it here too instead of leaving the
+      // manager to discover it only once a schedule comes back short.
+      const blocked = affected.filter((d) => ptoStatus[key(empId, d.idx)] === "PTO1");
+      setLeaveWarning(blocked.length > 0
+        ? `${emp?.name || "This employee"}'s forced-work tag (${leaveStart} to ${leaveEnd}) includes ${blocked.length} day(s) already approved as PTO-1: ${blocked.map((d) => `${d.wd} ${d.md}`).join(", ")}. The generator won't override approved leave — clear their PTO-1 first if they still need to work those days.`
+        : null);
+      setForcedHolidayWork((prev) => {
+        const next = { ...prev };
+        affected.forEach((d) => { next[key(empId, d.idx)] = true; });
+        return next;
+      });
+      bulkUpsertForcedHolidayWork(affected.map((d) => ({ employee_id: empId, day_iso: d.iso, owner_id: viewingOwnerId }))).catch(reportSyncError);
+      return;
+    }
+    // A PTO-1 request that overlaps a day already off per weekend
+    // rotation isn't using any extra leave — they weren't scheduled to
+    // work it either way — so flag it rather than silently stamping
+    // "manual" over the rotation day and (per guaranteeTargetForBlock)
+    // shrinking their real-shift guarantee for a day they were never
+    // going to work in the first place.
+    if (leaveType === "PTO1") {
+      const alreadyOff = affected.filter((d) => ptoStatus[key(empId, d.idx)] === "PTO1" && ptoSource[key(empId, d.idx)] === "weekend_rotation");
+      setLeaveWarning(alreadyOff.length > 0
+        ? `${emp?.name || "This employee"}'s PTO-1 request (${leaveStart} to ${leaveEnd}) includes ${alreadyOff.length} day(s) already off per weekend rotation: ${alreadyOff.map((d) => `${d.wd} ${d.md}`).join(", ")}. They weren't scheduled to work those days anyway, so this won't use any extra leave — just flagging in case that wasn't intended.`
+        : null);
+    } else {
+      setLeaveWarning(null);
+    }
     setPtoStatus((prev) => {
       const next = { ...prev };
       affected.forEach((d) => { next[key(empId, d.idx)] = leaveType; });
@@ -493,6 +574,15 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     if (!leaveStart || !leaveEnd || leaveStart > leaveEnd) return;
     const affected = days.filter((d) => d.iso >= leaveStart && d.iso <= leaveEnd);
     if (affected.length === 0) return;
+    if (leaveType === "FORCED") {
+      setForcedHolidayWork((prev) => {
+        const next = { ...prev };
+        affected.forEach((d) => { delete next[key(empId, d.idx)]; });
+        return next;
+      });
+      bulkDeleteForcedHolidayWork(empId, leaveStart, leaveEnd, viewingOwnerId).catch(reportSyncError);
+      return;
+    }
     setPtoStatus((prev) => {
       const next = { ...prev };
       affected.forEach((d) => { delete next[key(empId, d.idx)]; });
@@ -505,25 +595,43 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     });
     bulkDeletePtoStatus(empId, leaveStart, leaveEnd, viewingOwnerId).catch(reportSyncError);
   };
+  // Four-state cycle: available → PTO-1 (hard) → PTO-2 (soft) → forced
+  // holiday work → available. Each state is exclusive of the others —
+  // moving into one always clears whichever of PTO/DNS or the forced tag
+  // might still be set on this cell, so a click cycle never leaves two
+  // contradictory flags on the same day. Any manual click also claims
+  // the cell away from auto-set weekend rotation, same as before —
+  // future "Apply weekend rotation" runs will never touch it again.
   const cyclePto = (empId, dayIdx) => {
     const k = key(empId, dayIdx);
     const iso = days[dayIdx]?.iso;
-    // Any manual click claims the cell — future "Apply weekend rotation"
-    // runs will never touch it again, even if it started out auto-set.
-    setPtoSource((prev) => {
-      const next = { ...prev };
-      if (ptoStatus[k] === "PTO2") delete next[k]; // about to clear
-      else next[k] = "manual";
-      return next;
-    });
+    const currentState = forcedHolidayWork[k] ? 3 : ptoStatus[k] === "PTO1" ? 1 : ptoStatus[k] === "PTO2" ? 2 : 0;
+    const nextState = (currentState + 1) % 4;
+
     setPtoStatus((prev) => {
       const next = { ...prev };
-      let newStatus = null;
-      if (next[k] === "PTO1") { next[k] = "PTO2"; newStatus = "PTO2"; }
-      else if (next[k] === "PTO2") { delete next[k]; }
-      else { next[k] = "PTO1"; newStatus = "PTO1"; }
-      if (iso) (newStatus ? upsertPtoStatus(empId, iso, newStatus, "manual", viewingOwnerId) : deletePtoStatus(empId, iso, viewingOwnerId)).catch(reportSyncError);
+      if (nextState === 1) next[k] = "PTO1";
+      else if (nextState === 2) next[k] = "PTO2";
+      else delete next[k];
       return next;
+    });
+    setPtoSource((prev) => {
+      const next = { ...prev };
+      if (nextState === 1 || nextState === 2) next[k] = "manual"; else delete next[k];
+      return next;
+    });
+    setForcedHolidayWork((prev) => {
+      const next = { ...prev };
+      if (nextState === 3) next[k] = true; else delete next[k];
+      return next;
+    });
+
+    if (!iso) return;
+    queueCellWrite(k, async () => {
+      if (nextState === 1 || nextState === 2) await upsertPtoStatus(empId, iso, nextState === 1 ? "PTO1" : "PTO2", "manual", viewingOwnerId);
+      else await deletePtoStatus(empId, iso, viewingOwnerId);
+      if (nextState === 3) await bulkUpsertForcedHolidayWork([{ employee_id: empId, day_iso: iso, owner_id: viewingOwnerId }]);
+      else if (currentState === 3) await bulkDeleteForcedHolidayWork(empId, iso, iso, viewingOwnerId);
     });
   };
   const toggleExtraAvail = (empId, dayIdx) => {
@@ -686,7 +794,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         const blockDayIndices = blockDays.map((d) => d.idx);
         offset += blockLen;
         const anyPto1 = (e) => blockDays.some((d) => ptoStatus[key(e.id, d.idx)] === "PTO1");
-        const underCap = (e) => !wouldExceedShiftCap(e, workedDaysByEmp[e.id], blockDayIndices);
+        const underCap = (e) => !wouldExceedShiftCap(e, workedDaysByEmp[e.id], blockDayIndices, capForBlock(e));
         const blockDows = blockDays.map((d) => d.dow);
         const fitsFixedDays = (e) => respectsFixedDayRestriction(e, blockDows);
         const tier1 = permanent.filter((e) => e.allowedShifts.includes(code) && blockDays.every((d) => !ptoStatus[key(e.id, d.idx)]) && underCap(e) && fitsFixedDays(e) && !isCommitted(`p:${e.id}`, blockDays));
@@ -766,7 +874,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         && !e.fixedDays.includes(sat.dow) && !e.fixedDays.includes(sun.dow) // fixed days already get priority elsewhere
         && ptoStatus[key(e.id, sat.idx)] !== "PTO1" && ptoStatus[key(e.id, sun.idx)] !== "PTO1"
         && respectsFixedDayRestriction(e, [sat.dow, sun.dow])
-        && !wouldExceedShiftCap(e, workedDaysByEmp[e.id], [sat.idx, sun.idx])
+        && !wouldExceedShiftCap(e, workedDaysByEmp[e.id], [sat.idx, sun.idx], capForBlock(e))
         && !wouldExceedConsecutiveDays([...projectedFixedDayIndices[e.id], ...workedDaysByEmp[e.id]], [sat.idx, sun.idx], hardStreak);
 
       codes.forEach((shift) => {
@@ -827,7 +935,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     // picks up continuity days as the walk reaches them, so a shift
     // assigned today can't "not know" about a continuity block already
     // locked in for two weeks from now.
-    const underCap = (e) => !wouldExceedShiftCap(e, capWorkedDays[e.id], [day.idx]);
+    const underCap = (e) => !wouldExceedShiftCap(e, capWorkedDays[e.id], [day.idx], capForBlock(e));
     // Only bites in hard mode (maxConsecutiveDays passed as 0 disables
     // the check entirely, same trick wouldExceedShiftCap uses for "no
     // cap set"). In soft mode this preference is handled purely through
@@ -1023,7 +1131,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const hardStreak = consecutiveHardLimit ? maxConsecutiveDays : 0;
     const withinRules = (emp) => {
       const worked = workedDayIndicesFromSchedule(trialDays, emp.id);
-      return !wouldExceedShiftCap(emp, worked, []) && !wouldExceedConsecutiveDays(worked, [], hardStreak);
+      return !wouldExceedShiftCap(emp, worked, [], capForBlock(emp)) && !wouldExceedConsecutiveDays(worked, [], hardStreak);
     };
     if (!withinRules(E) || !withinRules(F)) return null;
     if (!respectsFixedDayRestriction(E, [Y.dow]) || !respectsFixedDayRestriction(F, [X.dow])) return null;
@@ -1045,7 +1153,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const hardStreak = consecutiveHardLimit ? maxConsecutiveDays : 0;
     const withinRules = (trialDays, emp) => {
       const worked = workedDayIndicesFromSchedule(trialDays, emp.id);
-      return !wouldExceedShiftCap(emp, worked, []) && !wouldExceedConsecutiveDays(worked, [], hardStreak);
+      return !wouldExceedShiftCap(emp, worked, [], capForBlock(emp)) && !wouldExceedConsecutiveDays(worked, [], hardStreak);
     };
     // First choice: someone already free that day and trained for the
     // empty shift — just add them, nobody else has to move.
@@ -1144,7 +1252,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         const usedIds = new Set(Object.values(day.assignment).map((v) => v.empId));
         const candidatesY = permanent.filter((e) => !usedIds.has(e.id) && !e.fixedDays.includes(day.dow) && !ptoStatus[key(e.id, day.idx)]
           && e.allowedShifts.includes(shiftX)
-          && !wouldExceedShiftCap(e, workedDayIndicesFromSchedule(current, e.id), [day.idx])
+          && !wouldExceedShiftCap(e, workedDayIndicesFromSchedule(current, e.id), [day.idx], capForBlock(e))
           && !wouldExceedConsecutiveDays(workedDayIndicesFromSchedule(current, e.id), [day.idx], consecutiveHardLimit ? maxConsecutiveDays : 0)
           && respectsFixedDayRestriction(e, [day.dow]));
         if (candidatesY.length) {
@@ -1352,13 +1460,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     // rules as the main pass. Reused both for the initial top-up and to
     // recover a block that the run-reshaping repair below just took a day
     // away from.
-    const topUpBlock = (employee, blockStart, windowDays, maxShifts) => {
+    const topUpBlock = (employee, blockStart, windowDays, target) => {
       const blockEnd = Math.min(blockStart + windowDays, days.length);
       const worked = workedDayIndicesFromSchedule(days, employee.id);
-      if (worked.filter((idx) => idx >= blockStart && idx < blockEnd).length >= maxShifts) return;
+      if (worked.filter((idx) => idx >= blockStart && idx < blockEnd).length >= target) return;
       const picks = pickOverflowDays(
-        worked, blockCandidates(employee, blockStart, blockEnd), days.length, windowDays, maxShifts,
-        (idx, runningWorked) => !wouldExceedShiftCap(employee, runningWorked, [idx])
+        worked, blockCandidates(employee, blockStart, blockEnd), days.length, windowDays, target,
+        (idx, runningWorked) => !wouldExceedShiftCap(employee, runningWorked, [idx], capForBlock(employee))
           && !(consecutiveHardLimit && wouldExceedConsecutiveDays(runningWorked, [idx], maxConsecutiveDays))
       );
       picks.forEach((idx) => applyPick(employee, idx));
@@ -1376,7 +1484,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const perm = permanent.find((p) => p.id !== employee.id && !used.has(p.id) && p.allowedShifts.includes(code)
         && ptoStatus[key(p.id, dayIdx)] !== "PTO1" && ptoStatus[key(p.id, dayIdx)] !== "PTO2"
         && respectsFixedDayRestriction(p, [day.dow])
-        && !wouldExceedShiftCap(p, workedDayIndicesFromSchedule(days, p.id), [dayIdx])
+        && !wouldExceedShiftCap(p, workedDayIndicesFromSchedule(days, p.id), [dayIdx], capForBlock(p))
         && !(consecutiveHardLimit && wouldExceedConsecutiveDays(workedDayIndicesFromSchedule(days, p.id), [dayIdx], maxConsecutiveDays)));
       if (perm) return { empId: perm.id, type: "permanent" };
       const ex = extra.find((x) => !used.has(x.id) && x.allowedShifts.includes(code) && extraAvailable[key(x.id, dayIdx)]);
@@ -1405,7 +1513,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
     permanent.filter((e) => e.shiftCap).forEach((e) => {
       const { windowDays, maxShifts } = e.shiftCap;
-      for (let b = 0; b < days.length; b += windowDays) topUpBlock(e, b, windowDays, maxShifts);
+      const targetForBlock = (blockStart) => guaranteeTargetForBlock(ptoStatus, ptoSource, e.id, blockStart, Math.min(blockStart + windowDays, days.length), maxShifts);
+      for (let b = 0; b < days.length; b += windowDays) topUpBlock(e, b, windowDays, targetForBlock(b));
 
       // Anything still short at this point was blocked purely by the
       // consecutive-day hard limit — not enough open days to add more
@@ -1419,9 +1528,9 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
           const blockEnd = Math.min(b + windowDays, days.length);
           let worked = workedDayIndicesFromSchedule(days, e.id);
           let count = worked.filter((idx) => idx >= b && idx < blockEnd).length;
-          if (count >= maxShifts) continue;
+          if (count >= targetForBlock(b)) continue;
           for (const dayIdx of blockCandidates(e, b, blockEnd)) {
-            if (count >= maxShifts) break;
+            if (count >= targetForBlock(b)) break;
             if (!wouldExceedConsecutiveDays(worked, [dayIdx], maxConsecutiveDays)) continue; // not actually blocked
             const sorted = [...worked, dayIdx].sort((x, y) => x - y);
             const at = sorted.indexOf(dayIdx);
@@ -1453,7 +1562,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 return { ...d, assignment: na, holes: holesOnDay({ ...d, assignment: na }) };
               });
               applyPick(e, dayIdx);
-              topUpBlock(e, Math.floor(pivotIdx / windowDays) * windowDays, windowDays, maxShifts);
+              const pivotBlockStart = Math.floor(pivotIdx / windowDays) * windowDays;
+              topUpBlock(e, pivotBlockStart, windowDays, targetForBlock(pivotBlockStart));
               worked = workedDayIndicesFromSchedule(days, e.id);
               count = worked.filter((idx) => idx >= b && idx < blockEnd).length;
               break;
@@ -1486,7 +1596,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       for (let b = 0; b < days.length; b += windowDays) {
         const blockEnd = Math.min(b + windowDays, days.length);
         const worked = workedDayIndicesFromSchedule(days, e.id);
-        if (worked.filter((idx) => idx >= b && idx < blockEnd).length >= maxShifts) continue;
+        if (worked.filter((idx) => idx >= b && idx < blockEnd).length >= targetForBlock(b)) continue;
         const candidates = blockCandidates(e, b, blockEnd);
         if (candidates.length === 0) continue;
         const getDay = (dayIdx) => days.find((d) => d.idx === dayIdx);
@@ -1533,16 +1643,71 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         ? assignWeekendPairs(continuityDaysByEmp)
         : { dayAssignment: {}, workedDaysByEmp: Object.fromEntries(permanent.map((e) => [e.id, []])) };
 
-      // Continuity blocks and paired weekend days are both decided for
-      // the WHOLE rotation in one shot above, before any regular-day
-      // assignment happens. Seed the cap trackers with all of it up
-      // front — otherwise a regular shift handed out early in the walk
-      // wouldn't "know" about a commitment already locked in for this
-      // person two weeks later, and the two together could quietly blow
-      // past their cap. PRN has its own tracker since their cap (if any)
-      // is separate from permanent staff's.
+      // "Force holiday (hard)" tags (Permanent Staff tab) are decided the
+      // same way, up front, for the whole rotation — a specific employee
+      // guaranteed a real shift on a specific date even if it would
+      // normally be their day off, for sparse holiday coverage. Skips
+      // (and flags) a tag that collides with approved PTO-1, or where
+      // nobody active that day matches their training — it never
+      // overrides approved leave, and never invents a shift from
+      // nothing. Also skips anyone already committed that day via
+      // continuity or weekend pairing — they're already guaranteed to
+      // work it, nothing more to force.
+      //
+      // Also checked against the employee's own hard cap before ever
+      // committing it — "always wins" never means "always exceeds the
+      // cap"; that one's non-negotiable. A continuity block or a
+      // weekend-pairing commitment already locked in for the same pay
+      // period (decided above, before any forced tag is looked at)
+      // counts toward this, same as a forced tag processed earlier in
+      // this same pass for the same employee — so two forced tags that
+      // alone would blow past the cap, or one that collides with a
+      // continuity run nobody else can cover, gets flagged instead of
+      // silently violating it. This checks the real flat cap, not the
+      // PTO-reduced guarantee target — forcing someone in is about the
+      // hard ceiling, not how few shifts their PTO says they still need.
+      const forcedByDay = {};
+      const forcedConflicts = [];
+      const forcedDaysByEmp = {};
+      permanent.forEach((e) => { forcedDaysByEmp[e.id] = []; });
+      permanent.forEach((e) => {
+        days.forEach((day) => {
+          if (!forcedHolidayWork[key(e.id, day.idx)]) return;
+          if (ptoStatus[key(e.id, day.idx)] === "PTO1") {
+            forcedConflicts.push(`${e.name} is tagged to force-work ${day.wd} ${day.md}, but has approved PTO-1 that day — not scheduled.`);
+            return;
+          }
+          const alreadyCommitted = Object.values(continuityByCode).some((map) => map[day.idx]?.empId === e.id)
+            || Object.values(weekendPaired[day.idx] || {}).some((info) => info.empId === e.id);
+          if (alreadyCommitted) return;
+          const existingWorked = [...continuityDaysByEmp[e.id], ...weekendPairedDays[e.id], ...forcedDaysByEmp[e.id]];
+          if (wouldExceedShiftCap(e, existingWorked, [day.idx])) {
+            forcedConflicts.push(`${e.name} is tagged to force-work ${day.wd} ${day.md}, but that would push them over their shift cap for that pay period — likely colliding with a continuity block, a weekend-pairing commitment, or another forced tag already locked in that period — not scheduled. Free up that period or pick a different date.`);
+            return;
+          }
+          const isWknd = day.isWeekend || holidays.has(day.iso);
+          const activeShifts = isWknd ? weekendShifts : weekdayShifts;
+          const isTaken = (code) => !!continuityByCode[code]?.[day.idx] || !!weekendPaired[day.idx]?.[code] || !!forcedByDay[day.idx]?.[code];
+          const code = pickForcedHolidayCode(activeShifts, e.allowedShifts, isContinuityCode, isTaken);
+          if (!code) {
+            forcedConflicts.push(`${e.name} is tagged to force-work ${day.wd} ${day.md}, but isn't trained for anything that runs that day — not scheduled.`);
+            return;
+          }
+          forcedByDay[day.idx] = { ...forcedByDay[day.idx], [code]: { empId: e.id, type: "permanent", override: false, fixed: true, forcedHoliday: true } };
+          forcedDaysByEmp[e.id].push(day.idx);
+        });
+      });
+
+      // Continuity blocks, paired weekend days, and forced holiday work
+      // are all decided for the WHOLE rotation in one shot above, before
+      // any regular-day assignment happens. Seed the cap trackers with
+      // all of it up front — otherwise a regular shift handed out early
+      // in the walk wouldn't "know" about a commitment already locked in
+      // for this person two weeks later, and the two together could
+      // quietly blow past their cap. PRN has its own tracker since their
+      // cap (if any) is separate from permanent staff's.
       const capWorkedDays = {};
-      permanent.forEach((e) => { capWorkedDays[e.id] = [...continuityDaysByEmp[e.id], ...weekendPairedDays[e.id]]; });
+      permanent.forEach((e) => { capWorkedDays[e.id] = [...continuityDaysByEmp[e.id], ...weekendPairedDays[e.id], ...forcedDaysByEmp[e.id]]; });
       const extraCapWorkedDays = {};
       extra.forEach((e) => { extraCapWorkedDays[e.id] = []; });
       days.forEach((day) => {
@@ -1560,6 +1725,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         const preToday = {};
         Object.entries(continuityByCode).forEach(([code, map]) => { if (map[day.idx]) preToday[code] = map[day.idx]; });
         if (weekendPaired[day.idx]) Object.entries(weekendPaired[day.idx]).forEach(([shift, entry]) => { preToday[shift] = entry; });
+        if (forcedByDay[day.idx]) Object.entries(forcedByDay[day.idx]).forEach(([shift, entry]) => { preToday[shift] = entry; });
         Object.entries(preToday).forEach(([shift, entry]) => {
           if (entry.type === "permanent") {
             const st = stats[entry.empId];
@@ -1585,7 +1751,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const optimizedDays = applyMinimumShiftGuarantees(searchedDays.map((d) => ({ ...d, holes: holesOnDay(d) })));
 
       const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts, weekendPairingEnabled, extendOffWeekends, cushionShiftCodes };
-      const scheduleSnapshot = { settingsUsed, costBefore, costAfter, iterations: 2500, numWeeks, startDate, ...buildScheduleDerived(optimizedDays) };
+      const scheduleSnapshot = { settingsUsed, costBefore, costAfter, iterations: 2500, numWeeks, startDate, forcedHolidayConflicts: forcedConflicts, ...buildScheduleDerived(optimizedDays) };
       setSchedule(scheduleSnapshot);
       setManualEditWarnings([]);
       saveScheduleSnapshot(scheduleSnapshot, viewingOwnerId).catch(reportSyncError);
@@ -1616,7 +1782,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     if (emp.type === "permanent") {
       const workedDays = newDays.filter((d) => Object.values(d.assignment).some((a) => a.empId === emp.id)).map((d) => d.idx);
       const otherWorkedDays = workedDays.filter((idx) => idx !== dayIdx);
-      if (wouldExceedShiftCap(emp, otherWorkedDays, [dayIdx])) warnings.push(`${emp.name} is now over their shift cap.`);
+      if (wouldExceedShiftCap(emp, otherWorkedDays, [dayIdx], capForBlock(emp))) warnings.push(`${emp.name} is now over their shift cap.`);
       if (consecutiveHardLimit && wouldExceedConsecutiveDays(otherWorkedDays, [dayIdx], maxConsecutiveDays)) warnings.push(`${emp.name} now has too many days in a row.`);
     }
     return warnings;
@@ -1634,7 +1800,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const perm = permanent.find((p) => p.id !== excludeEmpId && !used.has(p.id) && p.allowedShifts.includes(code)
       && ptoStatus[key(p.id, dayIdx)] !== "PTO1" && ptoStatus[key(p.id, dayIdx)] !== "PTO2"
       && respectsFixedDayRestriction(p, [day.dow])
-      && !wouldExceedShiftCap(p, workedDayIndicesFromSchedule(workingDays, p.id), [dayIdx])
+      && !wouldExceedShiftCap(p, workedDayIndicesFromSchedule(workingDays, p.id), [dayIdx], capForBlock(p))
       && !(consecutiveHardLimit && wouldExceedConsecutiveDays(workedDayIndicesFromSchedule(workingDays, p.id), [dayIdx], maxConsecutiveDays)));
     if (perm) return { empId: perm.id, type: "permanent" };
     const ex = extra.find((x) => x.id !== excludeEmpId && !used.has(x.id) && x.allowedShifts.includes(code) && extraAvailable[key(x.id, dayIdx)]);
@@ -1746,7 +1912,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
   const cellFor = (employee, day) => {
     const entry = Object.entries(day.assignment).find(([, info]) => info.empId === employee.id);
-    if (entry) return { code: overflowBaseCode(entry[0]), override: entry[1].override, manual: entry[1].manual, phantom: entry[1].phantom };
+    if (entry) return { code: overflowBaseCode(entry[0]), override: entry[1].override, manual: entry[1].manual, phantom: entry[1].phantom, forcedHoliday: entry[1].forcedHoliday };
     const k = key(employee.id, day.idx);
     const st = ptoStatus[k];
     // A weekend blocked off by their rotation cycle isn't the same thing
@@ -1782,15 +1948,23 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     if (!employee.shiftCap) return { total, cap: null, peak: total, over: false };
     const { windowDays, maxShifts } = employee.shiftCap;
     const peak = maxShiftsInAnyPayPeriod(worked, windowDays);
-    // What's actually reachable isn't a flat cap × periods — PTO-1 (including
-    // days auto-blocked by weekend rotation) removes candidate days, which
-    // forces the remaining ones closer together. Run the same fill the
-    // generator uses, from a clean slate, to get this employee's true
-    // achievable max so the denominator never shows an unreachable number.
+    // What's actually reachable isn't a flat cap × periods: approved
+    // PTO-1 counts toward the guarantee itself (a block with 3 days off
+    // only needs 7 real shifts against a 10-shift target, not 10), so
+    // each block's own target shrinks by however many PTO-1 days (not
+    // counting a weekend-rotation day off) fall inside it; a day auto-
+    // blocked by weekend rotation still removes a candidate day without
+    // lowering the target, the same as the generator treats it. Run the
+    // same fill the generator uses, from a clean slate, to get this
+    // employee's true achievable total so the denominator never shows
+    // an unreachable — or, with PTO ignored, an inflated — number.
     const candidateIndices = schedule.days
       .filter((d) => ptoStatus[key(employee.id, d.idx)] !== "PTO1")
       .map((d) => d.idx);
-    const scaledCap = pickOverflowDays([], candidateIndices, schedule.days.length, windowDays, maxShifts).length;
+    const targetForBlockIndex = (blockIndex) => guaranteeTargetForBlock(
+      ptoStatus, ptoSource, employee.id, blockIndex * windowDays, Math.min(blockIndex * windowDays + windowDays, schedule.days.length), maxShifts
+    );
+    const scaledCap = pickOverflowDays([], candidateIndices, schedule.days.length, windowDays, targetForBlockIndex).length;
     return { total, cap: scaledCap, peak, over: peak > maxShifts };
   };
 
@@ -1838,7 +2012,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       <table className="text-xs border-collapse">
         <thead>
           <tr>
-            <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[56px]" title="Running total for the whole schedule over their extended-hour cap, scaled up to the full schedule length. Moves up or down immediately with every drag or gap fill, so swapping two people always moves both numbers at once. Turns red if any single pay period actually goes over the cap — hover for the exact numbers.">Shifts</th>
+            <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[56px]" title="Running total for the whole schedule over their extended-hour cap, scaled up to the full schedule length. Approved PTO-1 counts toward the guarantee itself, so a pay period with time off needs fewer real shifts, not the same number crammed into what's left. Moves up or down immediately with every drag or gap fill, so swapping two people always moves both numbers at once. Turns red if any single pay period actually goes over the cap — hover for the exact numbers.">Shifts</th>
             <th className="sticky left-[56px] bg-white z-10 text-left px-3 py-2 border-b border-[#E4E7EC] min-w-[150px]">Employee</th>
             {schedule.days.map((d) => (
               <th key={d.idx} className={`px-1 py-2 border-b border-[#E4E7EC] font-normal text-center min-w-[36px] ${d.isWknd ? "bg-[#F1F5F9]" : ""}`}>
@@ -1866,7 +2040,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 {emp.name}{emp.type === "extra" && <span className="ml-1 text-[9px] text-[#64748B]">PRN</span>}
               </td>
               {schedule.days.map((d) => {
-                const { code, override, manual, phantom } = cellFor(emp, d);
+                const { code, override, manual, phantom, forcedHoliday } = cellFor(emp, d);
                 const isShift = ALL_SHIFT_CODES.includes(code);
                 const displayText = code === "OFF" ? "" : isShift ? shiftLabel(code) : code;
                 const bg = isShift ? getShiftColor(code) : (code === "PTO-1" || code === "WKND") ? "#DC2626" : code === "PTO-2" ? "#F59E0B" : code === "OFF" ? "#E4E7EC" : "transparent";
@@ -1879,10 +2053,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       className={phantom ? "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold animate-pulse" : "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"}
                       style={{
                         background: bg, color: fg, fontSize: gridCellFontSize(displayText),
-                        border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none",
+                        border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : forcedHoliday ? "3px dashed #2563EB" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none",
                         cursor: draggable ? "grab" : droppable ? "copy" : "default",
                       }}
-                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
+                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : forcedHoliday ? "Forced holiday work — scheduled here to cover sparse holiday staffing even though it's normally their day off." : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
                       draggable={draggable}
                       onDragStart={draggable ? (e) => { e.dataTransfer.setData("application/json", JSON.stringify({ empId: emp.id, dayIdx: d.idx })); e.dataTransfer.effectAllowed = "move"; } : undefined}
                       onDragOver={droppable ? (e) => e.preventDefault() : undefined}
@@ -1899,6 +2073,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       {displayText}{override ? "*" : ""}
                       {manual && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[#0D9488] border border-white" />}
                       {phantom && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#DC2626] border border-white text-white text-[8px] leading-3 font-bold">!</span>}
+                      {forcedHoliday && !phantom && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#2563EB] border border-white text-white text-[7px] leading-3 font-bold">H</span>}
                     </div>
                   </td>
                 );
@@ -2071,14 +2246,16 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 <img src="/instructions/apply-rotation.png" alt="Apply weekend rotation button with its explanation banner" className="w-full rounded border border-[#E4E7EC] mb-2" />
 
                 <h3 className="text-sm font-semibold mb-1">Bulk block a date range — faster than clicking day by day</h3>
-                <p className="text-xs text-[#33405A] mb-2">Above the employee list: set a start/end date, pick <b>PTO (hard)</b> or <b>DNS (soft)</b>, then click "Block" on that employee's row to fill their whole range at once. "Clear" (same row) removes either kind over that range. This is just a shortcut for setting the grid below — same two statuses, same rules.</p>
+                <p className="text-xs text-[#33405A] mb-2">Above the employee list: set a start/end date, pick <b>PTO (hard)</b>, <b>DNS (soft)</b>, or <b>Force holiday (hard)</b>, then click "Block" on that employee's row to fill their whole range at once. "Clear" (same row) removes whichever kind over that range. This is just a shortcut for setting the grid below — same statuses, same rules.</p>
+                <p className="text-xs text-[#33405A] mb-2"><b>Force holiday (hard)</b> is the opposite of PTO — it guarantees that employee a real shift on those dates even if it's normally their day off, for sparse holiday coverage. It won't override approved PTO-1 (you'll get a warning if the dates overlap), and a capped employee's pay period is automatically rebalanced so the forced day never pushes them over their max.</p>
 
                 <h3 className="text-sm font-semibold mb-1">The PTO grid — for everything rotation doesn't cover</h3>
-                <p className="text-xs text-[#33405A] mb-1">Below the button is a full calendar grid, one row per employee. Click any cell to cycle it through three states — use this for vacation, call-offs, or any one-off day that weekend rotation wouldn't know about:</p>
+                <p className="text-xs text-[#33405A] mb-1">Below the button is a full calendar grid, one row per employee. Click any cell to cycle it through four states — use this for vacation, call-offs, a one-off mandatory holiday, or any one-off day that weekend rotation wouldn't know about:</p>
                 <ul className="list-disc pl-9 text-xs text-[#33405A] space-y-1 mb-2">
-                  <li><b>Available</b> (blank) → <b>PTO-1, hard block</b> (red) → <b>PTO-2, soft/do-not-schedule</b> (amber) → back to available.</li>
+                  <li><b>Available</b> (blank) → <b>PTO-1, hard block</b> (red) → <b>PTO-2, soft/do-not-schedule</b> (amber) → <b>forced holiday work</b> (blue dot) → back to available.</li>
                   <li><b>PTO-1</b> is absolute — honored no matter what, even if it creates a coverage gap.</li>
                   <li><b>PTO-2</b> is a preference — honored unless the schedule genuinely can't be covered without that person.</li>
+                  <li><b>Forced holiday work</b> is the opposite of PTO — guarantees a real shift that day even if it's normally their day off. Each state is exclusive, so moving a cell into one clears whichever of the others might already be set there.</li>
                   <li>Cells with a dashed purple border were auto-set by "Apply weekend rotation" — clicking one to change it by hand takes it over permanently; that rotation will never overwrite your manual choice again.</li>
                 </ul>
                 <img src="/instructions/pto-grid.png" alt="PTO grid titled click a cell to cycle: available to PTO-1 hard to PTO-2 soft to available, with legend and red PTO-1 cells set by weekend rotation" className="w-full rounded border border-[#E4E7EC]" />
@@ -2529,10 +2706,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <div className="flex gap-1">
                     <button type="button" onClick={() => setLeaveType("PTO1")} className={`px-2.5 py-1.5 text-xs rounded border ${leaveType === "PTO1" ? "bg-[#DC2626] text-white border-[#DC2626]" : "border-[#E4E7EC] text-[#64748B]"}`}>PTO (hard)</button>
                     <button type="button" onClick={() => setLeaveType("PTO2")} className={`px-2.5 py-1.5 text-xs rounded border ${leaveType === "PTO2" ? "bg-[#F59E0B] text-white border-[#F59E0B]" : "border-[#E4E7EC] text-[#64748B]"}`}>DNS (soft)</button>
+                    <button type="button" title="Overrides their normal day off/rotation to guarantee a real shift on these dates — for sparse holiday coverage. Won't override approved PTO-1; adjusts the rest of their pay period so a capped employee never goes over their max." onClick={() => setLeaveType("FORCED")} className={`px-2.5 py-1.5 text-xs rounded border ${leaveType === "FORCED" ? "bg-[#2563EB] text-white border-[#2563EB]" : "border-[#E4E7EC] text-[#64748B]"}`}>Force holiday (hard)</button>
                   </div>
                 </div>
-                <p className="text-xs text-[#64748B] max-w-sm">Pick PTO or DNS, set the dates, then click "Block" on their row below. "Clear" (same row) undoes either.</p>
+                <p className="text-xs text-[#64748B] max-w-sm">Pick PTO, DNS, or Force holiday, set the dates, then click "Block" on their row below. "Clear" (same row) undoes any of the three.</p>
               </div>
+              {leaveWarning && (
+                <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-xs rounded px-3 py-2 mb-4 flex items-start justify-between gap-3">
+                  <span>⚠ {leaveWarning}</span>
+                  <button onClick={() => setLeaveWarning(null)} className="underline whitespace-nowrap">Dismiss</button>
+                </div>
+              )}
               <div className="flex flex-wrap items-end gap-3 mb-4 pb-4 border-b-2 border-[#0D9488]">
                 <div>
                   <label className="block text-xs font-semibold text-[#64748B] mb-1">Add employee</label>
@@ -2564,7 +2748,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       <button
                         onClick={() => blockLeave(emp.id)} disabled={!leaveStart || !leaveEnd}
                         className="ml-auto px-2 py-1 text-[10px] rounded border disabled:opacity-30"
-                        style={leaveType === "PTO2" ? { borderColor: "#F59E0B", color: "#F59E0B" } : { borderColor: "#DC2626", color: "#DC2626" }}
+                        style={leaveType === "PTO2" ? { borderColor: "#F59E0B", color: "#F59E0B" } : leaveType === "FORCED" ? { borderColor: "#2563EB", color: "#2563EB" } : { borderColor: "#DC2626", color: "#DC2626" }}
                       >
                         Block
                       </button>
@@ -2657,11 +2841,12 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
             <div className="bg-white rounded-lg border border-[#E4E7EC] overflow-hidden">
               <div className="px-4 py-3 border-b border-[#E4E7EC]">
-                <div className="text-sm font-semibold">PTO — click a cell to cycle: available → PTO-1 (hard) → PTO-2 (soft) → available</div>
-                <div className="flex gap-4 mt-2 text-xs">
+                <div className="text-sm font-semibold">PTO — click a cell to cycle: available → PTO-1 (hard) → PTO-2 (soft) → force holiday work → available</div>
+                <div className="flex gap-4 mt-2 text-xs flex-wrap">
                   <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#DC2626]" />PTO-1: honored no matter what</span>
                   <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#F59E0B]" />PTO-2: honored unless the schedule can't cover without them</span>
                   <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#DC2626]" style={{ border: "2px dashed #7C3AED" }} />dashed border = auto-set by weekend rotation</span>
+                  <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#F8FAFC] relative" style={{ border: "1px solid #E4E7EC" }}><span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[#2563EB] border border-white" /></span>blue dot = forced holiday work (overrides their normal day off)</span>
                   <span className="text-[#DC2626]">HOL = holiday — assign coverage manually here, same as any other day</span>
                 </div>
               </div>
@@ -2686,17 +2871,23 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                           const k = key(emp.id, d.idx);
                           const st = ptoStatus[k];
                           const autoGenerated = ptoSource[k] === "weekend_rotation";
+                          const forced = !!forcedHolidayWork[k];
                           return (
                             <td key={d.idx} className="border-b border-[#F1F5F9] p-0.5">
                               <button
                                 onClick={() => cyclePto(emp.id, d.idx)}
-                                title={autoGenerated ? "Auto-set by weekend rotation — click to override" : undefined}
-                                className="w-6 h-6 rounded-sm"
+                                title={[
+                                  autoGenerated ? "Auto-set by weekend rotation — click to override" : null,
+                                  forced ? "Tagged to force a real shift this day — click to clear" : null,
+                                ].filter(Boolean).join(" · ") || undefined}
+                                className="w-6 h-6 rounded-sm relative"
                                 style={{
                                   background: st === "PTO1" ? "#DC2626" : st === "PTO2" ? "#F59E0B" : d.isWeekend ? "#F1F5F9" : "#F8FAFC",
                                   border: autoGenerated ? "2px dashed #7C3AED" : (st === "PTO1" || st === "PTO2") ? "3px solid #000" : "1px solid #E4E7EC",
                                 }}
-                              />
+                              >
+                                {forced && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[#2563EB] border border-white" />}
+                              </button>
                             </td>
                           );
                         })}
@@ -2889,6 +3080,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 ℹ {schedule.weekendPairingMismatches.length} weekend(s) couldn't be paired to the same person — nobody permanent was free both days, so it fell back to covering each day separately: {schedule.weekendPairingMismatches.join("; ")}
               </div>
             )}
+            {schedule.forcedHolidayConflicts?.length > 0 && (
+              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
+                ⚠ {schedule.forcedHolidayConflicts.length} forced holiday-work tag(s) couldn't be honored: {schedule.forcedHolidayConflicts.join(" ")}
+              </div>
+            )}
             {manualEditWarnings.length > 0 && (
               <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2 flex items-start justify-between gap-3">
                 <span>⚠ After your last move: {manualEditWarnings.join(" ")}</span>
@@ -2961,6 +3157,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#DC2626]" />PTO-1</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#DC2626]" style={{ border: "2px dashed #7C3AED" }} />WKND (off per rotation, not leave)</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#F59E0B]" />PTO-2</div>
+              <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ border: "3px dashed #2563EB" }} />forced holiday work</div>
               <button
                 onClick={() => downloadScheduleCsv({ schedule, permanent, extra, ptoStatus, ptoSource, holidays, key, shiftLabel }, `schedule_${startDate}_${numWeeks}w.csv`)}
                 className="ml-auto px-3 py-1.5 text-xs font-semibold rounded border border-[#0D9488] text-[#0D9488] hover:bg-[#0D9488] hover:text-white"

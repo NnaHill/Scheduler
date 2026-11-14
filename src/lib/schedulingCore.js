@@ -59,10 +59,42 @@ export function maxShiftsInAnyPayPeriod(workedDayIndices, windowDays) {
   });
   return Math.max(0, ...Object.values(counts));
 }
-export function wouldExceedShiftCap(emp, existingWorkedDayIndices, proposedDayIndices) {
+// `perBlockCap`, if given, is a function `(blockIndex) => number` used
+// INSTEAD of the flat `emp.shiftCap.maxShifts` for every block — e.g.
+// guaranteeTargetForBlock, so an employee on approved PTO-1 is capped
+// at their reduced guarantee during matching too, not just topped up
+// to it afterward. Omitted (the default), this is the plain flat-cap
+// check it's always been.
+export function wouldExceedShiftCap(emp, existingWorkedDayIndices, proposedDayIndices, perBlockCap) {
   if (!emp.shiftCap) return false;
   const allDays = [...existingWorkedDayIndices, ...proposedDayIndices];
-  return maxShiftsInAnyPayPeriod(allDays, emp.shiftCap.windowDays) > emp.shiftCap.maxShifts;
+  if (!perBlockCap) return maxShiftsInAnyPayPeriod(allDays, emp.shiftCap.windowDays) > emp.shiftCap.maxShifts;
+  const counts = {};
+  allDays.forEach((idx) => {
+    const block = Math.floor(idx / emp.shiftCap.windowDays);
+    counts[block] = (counts[block] || 0) + 1;
+  });
+  return Object.entries(counts).some(([block, count]) => count > perBlockCap(Number(block)));
+}
+
+// Approved PTO-1 inside a pay-period block counts toward the guaranteed
+// shift total the same way a real pick does — someone granted 3 days
+// off that period only needs 7 real shifts to hit a 10-shift guarantee,
+// not 10 crammed into whatever's left over. A day blocked off purely by
+// weekend rotation is never counted here, even though it's stored the
+// same way (PTO1 status) — that's a normal part of the schedule the
+// "10 of 14" target already assumes, not time off reducing it further.
+// Doubles as wouldExceedShiftCap's perBlockCap: it's always ≤ maxShifts
+// (never more PTO means never a HIGHER number), so using it as the
+// ceiling during matching can only ever tighten things, never let
+// anyone past their real cap.
+export function guaranteeTargetForBlock(ptoStatus, ptoSource, employeeId, blockStart, blockEnd, maxShifts) {
+  let pto1Count = 0;
+  for (let idx = blockStart; idx < blockEnd; idx++) {
+    const k = key(employeeId, idx);
+    if (ptoStatus[k] === "PTO1" && ptoSource[k] !== "weekend_rotation") pto1Count++;
+  }
+  return Math.max(0, maxShifts - pto1Count);
 }
 
 // The one reserved shift code that can have more than one person on it
@@ -189,7 +221,12 @@ export function pickPhantomAnySteal(candidateDayIndices, getDay, allowedShifts, 
 // it rejects is skipped, not treated as using up the block's quota, so
 // the fill keeps trying later candidates instead of falling short of
 // target just because one specific day didn't work out.
+// `target` is normally the same number for every block, but it can also
+// be a function `(blockIndex) => number` for when different blocks need
+// different targets — e.g. a block with approved PTO-1 needing fewer
+// real shifts to hit its guarantee (see guaranteeTargetForBlock).
 export function pickOverflowDays(workedDayIndices, candidateIndices, totalDays, windowDays, target, isAcceptable) {
+  const targetFor = typeof target === "function" ? target : () => target;
   const candidates = new Set(candidateIndices);
   const blockCounts = {};
   const runningWorked = [...workedDayIndices];
@@ -201,7 +238,7 @@ export function pickOverflowDays(workedDayIndices, candidateIndices, totalDays, 
   for (let i = 0; i < totalDays; i++) {
     if (!candidates.has(i)) continue;
     const block = Math.floor(i / windowDays);
-    if ((blockCounts[block] || 0) >= target) continue;
+    if ((blockCounts[block] || 0) >= targetFor(block)) continue;
     if (isAcceptable && !isAcceptable(i, runningWorked)) continue;
     runningWorked.push(i);
     blockCounts[block] = (blockCounts[block] || 0) + 1;
@@ -379,6 +416,19 @@ export function kuhnMatch(slots, getCandidates) {
   }
   for (const slot of slots) tryFind(slot, new Set());
   return result;
+}
+
+// Which shift code a "force holiday work" tag should use for an
+// employee on a given day: any of that day's active shift codes
+// (weekdayShifts or weekendShifts, whichever applies — a holiday uses
+// the weekend set) they're trained for, skipping a continuity code (a
+// single forced day can't satisfy a 2-3 day continuity commitment) and
+// anything another pre-assignment (continuity, weekend pairing, or an
+// earlier forced tag the same day) already claimed. Returns null when
+// nothing fits — e.g. they aren't trained for anything that runs that
+// day — so the caller can flag it instead of silently skipping.
+export function pickForcedHolidayCode(activeShifts, allowedShifts, isContinuityCode, isCodeTaken) {
+  return activeShifts.find((code) => allowedShifts.includes(code) && !isContinuityCode(code) && !isCodeTaken(code)) || null;
 }
 
 // Decomposes a run of `len` consecutive days into blocks each

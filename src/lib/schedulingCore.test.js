@@ -8,6 +8,7 @@ import {
   NEVER_WORKED_BONUS,
   wouldExceedShiftCap,
   maxShiftsInAnyPayPeriod,
+  guaranteeTargetForBlock,
   isOverflowKey,
   overflowBaseCode,
   nextOverflowKey,
@@ -29,6 +30,7 @@ import {
   isAdjacentToOffWeekend,
   kuhnMatch,
   partitionRun,
+  pickForcedHolidayCode,
   pickPhantomCushionSlot,
   pickPhantomPermanentSwap,
   pickPhantomAnySteal,
@@ -118,6 +120,19 @@ describe("wouldExceedShiftCap", () => {
   test("days in different pay periods never exceed, no matter how close to a boundary", () => {
     expect(wouldExceedShiftCap(cap(14, 1), [13], [14])).toBe(false); // adjacent days, different blocks
   });
+
+  test("a perBlockCap tightens the ceiling for just the block it applies to", () => {
+    // block 0 (days 0-13) gets a reduced ceiling of 2 (e.g. PTO-adjusted);
+    // block 1 (days 14-27) keeps the full flat cap of 3.
+    const perBlockCap = (block) => (block === 0 ? 2 : 3);
+    expect(wouldExceedShiftCap(cap(14, 3), [0, 1], [2], perBlockCap)).toBe(true); // 3 in block 0 > reduced cap 2
+    expect(wouldExceedShiftCap(cap(14, 3), [0], [1], perBlockCap)).toBe(false); // 2 in block 0, at the reduced cap
+    expect(wouldExceedShiftCap(cap(14, 3), [14, 15], [16], perBlockCap)).toBe(false); // 3 in block 1, under its own flat cap of 3
+  });
+
+  test("without a perBlockCap, behavior is unchanged from the flat cap", () => {
+    expect(wouldExceedShiftCap(cap(14, 3), [0, 1], [2], undefined)).toBe(false);
+  });
 });
 
 describe("maxShiftsInAnyPayPeriod", () => {
@@ -135,6 +150,53 @@ describe("maxShiftsInAnyPayPeriod", () => {
     // 1 — they're one day apart but in different pay periods, so neither
     // block's count goes above 1.
     expect(maxShiftsInAnyPayPeriod([13, 14], 14)).toBe(1);
+  });
+});
+
+describe("guaranteeTargetForBlock", () => {
+  const k = (empId, idx) => `${empId}_${idx}`;
+
+  test("no PTO-1 in the block leaves the target unchanged", () => {
+    const ptoStatus = {};
+    const ptoSource = {};
+    expect(guaranteeTargetForBlock(ptoStatus, ptoSource, 1, 0, 14, 10)).toBe(10);
+  });
+
+  test("each approved PTO-1 day lowers the target by one", () => {
+    const ptoStatus = { [k(1, 2)]: "PTO1", [k(1, 5)]: "PTO1", [k(1, 9)]: "PTO1" };
+    const ptoSource = { [k(1, 2)]: "manual", [k(1, 5)]: "manual", [k(1, 9)]: "manual" };
+    expect(guaranteeTargetForBlock(ptoStatus, ptoSource, 1, 0, 14, 10)).toBe(7);
+  });
+
+  test("a day off purely from weekend rotation never lowers the target", () => {
+    const ptoStatus = { [k(1, 2)]: "PTO1", [k(1, 5)]: "PTO1" };
+    const ptoSource = { [k(1, 2)]: "manual", [k(1, 5)]: "weekend_rotation" };
+    expect(guaranteeTargetForBlock(ptoStatus, ptoSource, 1, 0, 14, 10)).toBe(9);
+  });
+
+  test("PTO-2 never lowers the target", () => {
+    const ptoStatus = { [k(1, 2)]: "PTO2" };
+    const ptoSource = { [k(1, 2)]: "manual" };
+    expect(guaranteeTargetForBlock(ptoStatus, ptoSource, 1, 0, 14, 10)).toBe(10);
+  });
+
+  test("a PTO-1 day for a DIFFERENT employee is ignored", () => {
+    const ptoStatus = { [k(2, 2)]: "PTO1" };
+    const ptoSource = { [k(2, 2)]: "manual" };
+    expect(guaranteeTargetForBlock(ptoStatus, ptoSource, 1, 0, 14, 10)).toBe(10);
+  });
+
+  test("a PTO-1 day outside the block's range is ignored", () => {
+    const ptoStatus = { [k(1, 20)]: "PTO1" };
+    const ptoSource = { [k(1, 20)]: "manual" };
+    expect(guaranteeTargetForBlock(ptoStatus, ptoSource, 1, 0, 14, 10)).toBe(10);
+  });
+
+  test("never drops below zero even with more PTO-1 days than the target", () => {
+    const ptoStatus = {};
+    const ptoSource = {};
+    for (let i = 0; i < 14; i++) { ptoStatus[k(1, i)] = "PTO1"; ptoSource[k(1, i)] = "manual"; }
+    expect(guaranteeTargetForBlock(ptoStatus, ptoSource, 1, 0, 14, 10)).toBe(0);
   });
 });
 
@@ -226,6 +288,19 @@ describe("pickOverflowDays", () => {
     const picks = pickOverflowDays(worked, [3, 4, 9], 56, 14, 10, isAcceptable);
     expect(picks).toEqual([3, 9]); // 4 skipped (would make an 8-day run), 9 used instead
     expect(worked.length + picks.length).toBe(10); // target still reached
+  });
+
+  test("accepts a per-block target function instead of a flat number", () => {
+    // block 0 (days 0-13) has a lower target (7, e.g. from PTO) than
+    // block 1 (days 14-27, target 10) — each block should fill to its
+    // own number, not the other's.
+    const targetFor = (block) => (block === 0 ? 7 : 10);
+    const candidates = Array.from({ length: 28 }, (_, i) => i);
+    const picks = pickOverflowDays([], candidates, 28, 14, targetFor);
+    const block0 = picks.filter((idx) => idx < 14);
+    const block1 = picks.filter((idx) => idx >= 14);
+    expect(block0.length).toBe(7);
+    expect(block1.length).toBe(10);
   });
 });
 
@@ -652,6 +727,34 @@ describe("kuhnMatch", () => {
     const result = kuhnMatch(["A", "B"], (slot) => candidates[slot]);
     expect(result.B).toBe("x");
     expect(result.A).toBe("y");
+  });
+});
+
+describe("pickForcedHolidayCode", () => {
+  const noContinuity = () => false;
+  const notTaken = () => false;
+
+  test("picks the first active code the employee is trained for", () => {
+    expect(pickForcedHolidayCode(["E1", "E2", "E4"], ["E2", "E4"], noContinuity, notTaken)).toBe("E2");
+  });
+
+  test("returns null when untrained for anything active that day", () => {
+    expect(pickForcedHolidayCode(["E1", "E4"], ["E9"], noContinuity, notTaken)).toBeNull();
+  });
+
+  test("skips a continuity code even if trained for it", () => {
+    const isContinuityCode = (code) => code === "E1";
+    expect(pickForcedHolidayCode(["E1", "E4"], ["E1", "E4"], isContinuityCode, notTaken)).toBe("E4");
+  });
+
+  test("skips a code something else already claimed that day", () => {
+    const isTaken = (code) => code === "E1";
+    expect(pickForcedHolidayCode(["E1", "E4"], ["E1", "E4"], noContinuity, isTaken)).toBe("E4");
+  });
+
+  test("returns null when every active code is either untrained or already taken", () => {
+    const isTaken = (code) => code === "E4";
+    expect(pickForcedHolidayCode(["E1", "E4"], ["E4"], noContinuity, isTaken)).toBeNull();
   });
 });
 

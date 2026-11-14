@@ -186,6 +186,35 @@ export async function deletePtoStatus(employeeId, iso, ownerId) {
   if (error) throw error;
 }
 
+// "Force holiday work" tags — same shape/usage pattern as PTO's bulk
+// block/clear, but the opposite intent: existence of a row means this
+// employee MUST be scheduled a real shift that day.
+export async function fetchForcedHolidayWork(startIso, endIso, ownerId) {
+  const { data, error } = await supabase
+    .from("forced_holiday_work")
+    .select("employee_id, day_iso")
+    .eq("owner_id", ownerId)
+    .gte("day_iso", startIso)
+    .lte("day_iso", endIso);
+  if (error) throw error;
+  return data;
+}
+export async function bulkUpsertForcedHolidayWork(rows) {
+  if (rows.length === 0) return;
+  const { error } = await supabase.from("forced_holiday_work").upsert(rows, { onConflict: "employee_id,day_iso" });
+  if (error) throw error;
+}
+export async function bulkDeleteForcedHolidayWork(employeeId, startIso, endIso, ownerId) {
+  const { error } = await supabase
+    .from("forced_holiday_work")
+    .delete()
+    .eq("employee_id", employeeId)
+    .eq("owner_id", ownerId)
+    .gte("day_iso", startIso)
+    .lte("day_iso", endIso);
+  if (error) throw error;
+}
+
 export async function fetchExtraAvailability(startIso, endIso, ownerId) {
   const { data, error } = await supabase
     .from("extra_availability")
