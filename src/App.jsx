@@ -30,7 +30,7 @@ import {
   wouldExceedShiftCap, maxShiftsInAnyPayPeriod, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
   weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, isAdjacentToOffWeekend, kuhnMatch, partitionRun,
   longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, countBackToBackSameShift, unfilledShifts,
-  OVERFLOW_CODE, isOverflowKey, overflowBaseCode, nextOverflowKey, pickOverflowDays,
+  OVERFLOW_CODE, isOverflowKey, overflowBaseCode, nextOverflowKey, pickOverflowDays, pickPhantomCushionSlot, pickPhantomPermanentSwap, pickPhantomAnySteal,
 } from "./lib/schedulingCore";
 import { buildFeasibilityReport } from "./lib/feasibility";
 import { buildOptimizationTips } from "./lib/optimizationTips";
@@ -84,6 +84,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [avoidLonelyShifts, setAvoidLonelyShifts] = useState(true);
   const [weekendPairingEnabled, setWeekendPairingEnabled] = useState(true);
   const [extendOffWeekends, setExtendOffWeekends] = useState(false);
+  // Shift code(s) a manager would rather hand someone a long week via —
+  // usually a float role, lighter than their regular assignment. Used
+  // only to pick which PRN shift gets displaced for a phantom
+  // needs-coverage flag, when there's a choice of which one to take.
+  const [cushionShiftCodes, setCushionShiftCodes] = useState([]);
   const [manualEditWarnings, setManualEditWarnings] = useState([]);
   const [employees, setEmployees] = useState([]);
   const [ptoStatus, setPtoStatus] = useState({});
@@ -183,6 +188,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
           setAvoidLonelyShifts(s.avoidLonelyShifts);
           setWeekendPairingEnabled(s.weekendPairingEnabled);
           setExtendOffWeekends(!!s.extendOffWeekends);
+          setCushionShiftCodes(s.cushionShiftCodes || []);
         }
       } catch (err) {
         if (!cancelled) reportSyncError(err);
@@ -1377,6 +1383,26 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       return ex ? { empId: ex.id, type: "extra" } : null;
     };
 
+    // Applies the donor's side of a pickPhantomPermanentSwap plan
+    // (their new, real replacement shift) and hands back the
+    // {dayIdx, code} the caller still needs to assign to the phantom-
+    // flagged employee. The decision itself lives in
+    // pickPhantomPermanentSwap so it's covered by unit tests; this is
+    // just the `days` mutation.
+    const applyPermanentCushionSwap = (candidates, e) => {
+      const plan = pickPhantomPermanentSwap(
+        candidates, (dayIdx) => { const d = days.find((dd) => dd.idx === dayIdx); return { assignment: d.assignment, holes: d.holes }; },
+        e.allowedShifts, cushionShiftCodes, e.id, (empId) => permanent.find((p) => p.id === empId)?.allowedShifts, isContinuityCode
+      );
+      if (!plan) return null;
+      days = days.map((d) => {
+        if (d.idx !== plan.dayIdx) return d;
+        const na = { ...d.assignment, [plan.replacementCode]: { empId: plan.donorId, type: "permanent", override: false, fixed: false } };
+        return { ...d, assignment: na, holes: holesOnDay({ ...d, assignment: na }) };
+      });
+      return { dayIdx: plan.dayIdx, code: plan.code };
+    };
+
     permanent.filter((e) => e.shiftCap).forEach((e) => {
       const { windowDays, maxShifts } = e.shiftCap;
       for (let b = 0; b < days.length; b += windowDays) topUpBlock(e, b, windowDays, maxShifts);
@@ -1445,15 +1471,34 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       // coverage. It counts toward the displayed total, same as a real
       // pick, so the shortfall is visible in the Shifts column instead of
       // just quietly missing.
+      //
+      // Which day/code gets flagged prefers the manager's chosen
+      // "cushion" code (a float role, usually easier than the rest)
+      // above everything else, tried in order: take it over from a PRN
+      // already covering it, claim it directly on a day nobody's using
+      // it yet, or take it from a PERMANENT employee instead as long
+      // as THEY can be handed something real in return that same day
+      // (never left with a bare E0). Only once none of that works
+      // anywhere in the block does this fall back to displacing any
+      // PRN's real shift regardless of cushion (still better than a
+      // placeholder), and only once THAT fails too does it settle for
+      // a plain E0 filler on the first open day.
       for (let b = 0; b < days.length; b += windowDays) {
         const blockEnd = Math.min(b + windowDays, days.length);
         const worked = workedDayIndicesFromSchedule(days, e.id);
         if (worked.filter((idx) => idx >= b && idx < blockEnd).length >= maxShifts) continue;
-        const openDay = blockCandidates(e, b, blockEnd)[0];
-        if (openDay == null) continue;
+        const candidates = blockCandidates(e, b, blockEnd);
+        if (candidates.length === 0) continue;
+        const getDay = (dayIdx) => days.find((d) => d.idx === dayIdx);
+        const pick = pickPhantomCushionSlot(candidates, getDay, e.allowedShifts, cushionShiftCodes, isContinuityCode)
+          || applyPermanentCushionSwap(candidates, e)
+          || pickPhantomAnySteal(candidates, getDay, e.allowedShifts, isContinuityCode);
+        const openDay = pick ? pick.dayIdx : candidates[0];
+
         days = days.map((d) => {
           if (d.idx !== openDay) return d;
-          const newAssignment = { ...d.assignment, [nextOverflowKey(d.assignment)]: { empId: e.id, type: "permanent", override: false, fixed: false, phantom: true } };
+          const newAssignment = { ...d.assignment };
+          newAssignment[pick ? pick.code : nextOverflowKey(d.assignment)] = { empId: e.id, type: "permanent", override: false, fixed: false, phantom: true };
           return { ...d, assignment: newAssignment, holes: holesOnDay({ ...d, assignment: newAssignment }) };
         });
       }
@@ -1539,7 +1584,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const { days: searchedDays, finalCost: costAfter } = localSearch(initialDays, 2500);
       const optimizedDays = applyMinimumShiftGuarantees(searchedDays.map((d) => ({ ...d, holes: holesOnDay(d) })));
 
-      const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts, weekendPairingEnabled, extendOffWeekends };
+      const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts, weekendPairingEnabled, extendOffWeekends, cushionShiftCodes };
       const scheduleSnapshot = { settingsUsed, costBefore, costAfter, iterations: 2500, numWeeks, startDate, ...buildScheduleDerived(optimizedDays) };
       setSchedule(scheduleSnapshot);
       setManualEditWarnings([]);
@@ -1752,6 +1797,26 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // Every unfilled shift, flattened to one row per (day, code) — feeds
   // the "Fill a coverage gap" card. Empty once nothing's left to fill.
   const gapsList = schedule ? schedule.days.flatMap((d) => d.holes.map((code) => ({ day: d, code }))) : [];
+  // Days with spare (E0) coverage — someone's already an extra body
+  // beyond what the day actually needs, so it's worth a look before
+  // approving a PTO request. A genuine overflow pick is a comfortable
+  // cushion; a phantom that fell back to E0 is also an extra body that
+  // day, but a forced one (the algorithm had to override the
+  // consecutive-day limit for them elsewhere in their own schedule), so
+  // the two are kept separate rather than blended into one reassuring
+  // number. A phantom that instead took over someone's real shift (not
+  // a fresh E0) isn't a net-new body at all, so it's left out entirely.
+  const overflowDaysList = schedule ? schedule.days
+    .map((d) => {
+      const nameOf = (empId) => [...permanent, ...extra].find((p) => p.id === empId)?.name || "?";
+      const overflowEntries = Object.entries(d.assignment).filter(([code]) => isOverflowKey(code));
+      return {
+        day: d,
+        names: overflowEntries.filter(([, info]) => !info.phantom).map(([, info]) => nameOf(info.empId)),
+        phantomNames: overflowEntries.filter(([, info]) => info.phantom).map(([, info]) => nameOf(info.empId)),
+      };
+    })
+    .filter((x) => x.names.length > 0 || x.phantomNames.length > 0) : [];
   // Who could plausibly take a given gap: not already working that day
   // (hard — a person can't be in two places at once) and not on
   // approved PTO-1 leave / marked unavailable that day (hard, same rule
@@ -2221,6 +2286,20 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <input type="checkbox" checked={extendOffWeekends} onChange={(e) => setExtendOffWeekends(e.target.checked)} />
                   Extend off-weekends into longer weekends
                 </label>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#64748B] mb-1" title="When a shortfall can't be safely resolved and gets flagged for manual coverage, prefer taking over a PRN's shift in one of these codes (e.g. a float role) over any other shift that's up for grabs — easier on whoever ends up covering it. Pick as many as apply; none selected just means no preference.">Cushion shift(s) for flagged shortfalls</label>
+                <div className="flex flex-wrap gap-1 max-w-[200px]">
+                  {trainableShiftCodes.map((code) => (
+                    <button
+                      key={code} type="button"
+                      onClick={() => setCushionShiftCodes((prev) => (prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code]))}
+                      className={`text-[10px] px-2 py-1 rounded border ${cushionShiftCodes.includes(code) ? "bg-[#0D9488] text-white border-[#0D9488]" : "bg-white text-[#64748B] border-[#E4E7EC]"}`}
+                    >
+                      {shiftLabel(code)}
+                    </button>
+                  ))}
+                </div>
               </div>
               <div className="flex-1" />
               {permanent.length === 0 && (
@@ -2819,32 +2898,60 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
             <div className="bg-[#EFF6FF] border border-[#BFDBFE] text-[#1E3A8A] text-xs rounded px-3 py-2">
               ✋ Drag any shift cell onto another to swap them by hand — a small teal dot marks a cell you've moved. Fairness Report, Optimization, and Export CSV all update to match. Locked-leave days and continuity shifts can't be dragged onto or moved.
             </div>
-            {gapsList.length > 0 && (
+            {(gapsList.length > 0 || overflowDaysList.length > 0) && (
               <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
-                <div className="text-sm font-semibold mb-1">Fill a coverage gap</div>
-                <p className="text-xs text-[#64748B] mb-3">Pick who covers each empty shift below — same as a drag-and-drop move, so Fairness Report, Optimization, and Export CSV all update to match. You'll get a warning (not a block) if they're not trained for it or it pushes them over a limit.</p>
-                <div className="space-y-2">
-                  {gapsList.map(({ day, code }) => (
-                    <div key={`${day.idx}-${code}`} className="flex items-center gap-2 flex-wrap text-xs">
-                      <span className="px-2 py-1 rounded font-mono font-semibold text-white min-w-[48px] text-center" style={{ background: getShiftColor(code) }}>{shiftLabel(code)}</span>
-                      <span className="text-[#64748B] w-20">{day.wd} {day.md}</span>
-                      <select
-                        defaultValue=""
-                        onChange={(e) => {
-                          if (!e.target.value) return;
-                          const chosen = [...permanent, ...extra].find((x) => String(x.id) === e.target.value);
-                          if (chosen) applyManualFill(chosen, day.idx, code);
-                        }}
-                        className="border border-[#E4E7EC] rounded px-2 py-1 text-xs"
-                      >
-                        <option value="">Assign to…</option>
-                        {eligibleCandidatesFor(day, code).map((c) => (
-                          <option key={c.id} value={c.id}>{c.name}{c.type === "extra" ? " (PRN)" : ""}{!c.trained ? " — not trained" : ""}</option>
-                        ))}
-                      </select>
+                {gapsList.length > 0 && (
+                  <>
+                    <div className="text-sm font-semibold mb-1">Fill a coverage gap</div>
+                    <p className="text-xs text-[#64748B] mb-3">Pick who covers each empty shift below — same as a drag-and-drop move, so Fairness Report, Optimization, and Export CSV all update to match. You'll get a warning (not a block) if they're not trained for it or it pushes them over a limit.</p>
+                    <div className="space-y-2">
+                      {gapsList.map(({ day, code }) => (
+                        <div key={`${day.idx}-${code}`} className="flex items-center gap-2 flex-wrap text-xs">
+                          <span className="px-2 py-1 rounded font-mono font-semibold text-white min-w-[48px] text-center" style={{ background: getShiftColor(code) }}>{shiftLabel(code)}</span>
+                          <span className="text-[#64748B] w-20">{day.wd} {day.md}</span>
+                          <select
+                            defaultValue=""
+                            onChange={(e) => {
+                              if (!e.target.value) return;
+                              const chosen = [...permanent, ...extra].find((x) => String(x.id) === e.target.value);
+                              if (chosen) applyManualFill(chosen, day.idx, code);
+                            }}
+                            className="border border-[#E4E7EC] rounded px-2 py-1 text-xs"
+                          >
+                            <option value="">Assign to…</option>
+                            {eligibleCandidatesFor(day, code).map((c) => (
+                              <option key={c.id} value={c.id}>{c.name}{c.type === "extra" ? " (PRN)" : ""}{!c.trained ? " — not trained" : ""}</option>
+                            ))}
+                          </select>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  </>
+                )}
+                {overflowDaysList.length > 0 && (
+                  <div className={gapsList.length > 0 ? "mt-4 pt-3 border-t border-[#E4E7EC]" : ""}>
+                    <div className="text-sm font-semibold mb-1">Days with spare (E0) coverage</div>
+                    <p className="text-xs text-[#64748B] mb-2">Someone's already padded up beyond what the day needs on these days — a safer first look if you need to approve a PTO request. Amber ones include someone flagged there by force (a consecutive-day override), not a comfortable cushion — check their row before counting on it.</p>
+                    <div className="flex flex-wrap gap-2 text-xs">
+                      {overflowDaysList.map(({ day, names, phantomNames }) => {
+                        const hasPhantom = phantomNames.length > 0;
+                        const title = [
+                          names.length ? `Spare: ${names.join(", ")}` : null,
+                          hasPhantom ? `Forced (flagged, needs coverage): ${phantomNames.join(", ")}` : null,
+                        ].filter(Boolean).join(" — ");
+                        return (
+                          <span
+                            key={day.idx}
+                            className={hasPhantom ? "px-2 py-1 rounded bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E]" : "px-2 py-1 rounded bg-[#F0FDFA] border border-[#99F6E4] text-[#0D9488]"}
+                            title={title}
+                          >
+                            {day.wd} {day.md} · {names.length + phantomNames.length}{hasPhantom ? " ⚠" : ""}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
             <div className="flex items-center gap-3 flex-wrap text-xs">

@@ -29,6 +29,9 @@ import {
   isAdjacentToOffWeekend,
   kuhnMatch,
   partitionRun,
+  pickPhantomCushionSlot,
+  pickPhantomPermanentSwap,
+  pickPhantomAnySteal,
 } from "./schedulingCore";
 
 describe("toLocalISO", () => {
@@ -223,6 +226,147 @@ describe("pickOverflowDays", () => {
     const picks = pickOverflowDays(worked, [3, 4, 9], 56, 14, 10, isAcceptable);
     expect(picks).toEqual([3, 9]); // 4 skipped (would make an 8-day run), 9 used instead
     expect(worked.length + picks.length).toBe(10); // target still reached
+  });
+});
+
+describe("pickPhantomCushionSlot / pickPhantomAnySteal", () => {
+  const noContinuity = () => false;
+  const ALL_CODES = ["E0", "E3", "E5", "E7", "E9"];
+  const days = {
+    1: { assignment: { E0: { type: "permanent" } }, activeShifts: ALL_CODES }, // nothing stealable here
+    2: { assignment: { E3: { type: "extra" } }, activeShifts: ALL_CODES }, // a PRN's real shift — stealable
+    3: { assignment: { E5: { type: "extra" } }, activeShifts: ALL_CODES }, // a PRN's real shift, matches a cushion code
+    4: { assignment: { E7: { type: "extra", fixed: true } }, activeShifts: ALL_CODES }, // fixed — never touched
+    5: { assignment: {}, activeShifts: ALL_CODES }, // wide open — a cushion code can be claimed directly here
+    6: { assignment: { E5: { type: "permanent" } }, activeShifts: ALL_CODES }, // cushion code already spoken for — not open
+    7: { assignment: { E3: { type: "extra" }, E5: { type: "permanent" } }, activeShifts: ALL_CODES }, // E3 stealable, but E5 (cushion) already spoken for too
+    8: { assignment: {}, activeShifts: ["E3"] }, // open, but the cushion code (E5) isn't active this day at all (e.g. a weekend it's excluded from)
+  };
+  const getDay = (idx) => days[idx];
+
+  test("pickPhantomAnySteal takes over a PRN's real shift", () => {
+    expect(pickPhantomAnySteal([1, 2], getDay, ["E3"], noContinuity)).toEqual({ dayIdx: 2, code: "E3" });
+  });
+
+  test("pickPhantomAnySteal returns null when nothing in the block is stealable", () => {
+    expect(pickPhantomAnySteal([1], getDay, ["E0", "E3", "E5"], noContinuity)).toBeNull();
+  });
+
+  test("pickPhantomAnySteal never steals a shift the employee isn't trained for", () => {
+    expect(pickPhantomAnySteal([2], getDay, ["E9"], noContinuity)).toBeNull();
+  });
+
+  test("pickPhantomAnySteal never steals a fixed (continuity/weekend-pairing) commitment", () => {
+    expect(pickPhantomAnySteal([4], getDay, ["E7"], noContinuity)).toBeNull();
+  });
+
+  test("pickPhantomAnySteal never steals a continuity-coded shift even when it isn't marked fixed", () => {
+    const isContinuityCode = (code) => code === "E3";
+    expect(pickPhantomAnySteal([2], getDay, ["E3"], isContinuityCode)).toBeNull();
+  });
+
+  test("pickPhantomCushionSlot returns null when no cushion codes are configured", () => {
+    expect(pickPhantomCushionSlot([3], getDay, ["E5"], [], noContinuity)).toBeNull();
+  });
+
+  test("pickPhantomCushionSlot steals a cushion-coded PRN shift over an earlier non-cushion one", () => {
+    expect(pickPhantomCushionSlot([2, 3], getDay, ["E3", "E5"], ["E5"], noContinuity)).toEqual({ dayIdx: 3, code: "E5" });
+  });
+
+  test("pickPhantomCushionSlot ignores a non-cushion PRN shift entirely", () => {
+    expect(pickPhantomCushionSlot([2], getDay, ["E3"], ["E5"], noContinuity)).toBeNull();
+  });
+
+  test("pickPhantomCushionSlot claims an open cushion slot directly when nothing is stealable there", () => {
+    expect(pickPhantomCushionSlot([5], getDay, ["E5"], ["E5"], noContinuity)).toEqual({ dayIdx: 5, code: "E5" });
+  });
+
+  test("pickPhantomCushionSlot prefers stealing a cushion-coded PRN shift over claiming an open cushion slot elsewhere", () => {
+    expect(pickPhantomCushionSlot([5, 3], getDay, ["E5"], ["E5"], noContinuity)).toEqual({ dayIdx: 3, code: "E5" });
+  });
+
+  test("pickPhantomCushionSlot never claims a cushion slot someone else already has that day", () => {
+    expect(pickPhantomCushionSlot([6], getDay, ["E5"], ["E5"], noContinuity)).toBeNull();
+  });
+
+  test("pickPhantomCushionSlot never claims a continuity-coded cushion slot", () => {
+    const isContinuityCode = (code) => code === "E5";
+    expect(pickPhantomCushionSlot([5], getDay, ["E5"], ["E5"], isContinuityCode)).toBeNull();
+  });
+
+  test("pickPhantomCushionSlot skips a day where the cushion code is already spoken for, even though something else there is stealable", () => {
+    // day 7: E3 is a stealable PRN shift, but it isn't the cushion code,
+    // and E5 (the cushion code) is already a permanent employee's real
+    // shift there — day 5 is the only place E5 is actually open.
+    expect(pickPhantomCushionSlot([7, 5], getDay, ["E3", "E5"], ["E5"], noContinuity)).toEqual({ dayIdx: 5, code: "E5" });
+  });
+
+  test("never claims an open cushion slot on a day the cushion code isn't actually active (e.g. a weekend it's excluded from)", () => {
+    // day 8: wide open, but E5 isn't in that day's active shift list at
+    // all, so "nobody has it" must NOT be read as "available to claim".
+    expect(pickPhantomCushionSlot([8, 5], getDay, ["E5"], ["E5"], noContinuity)).toEqual({ dayIdx: 5, code: "E5" });
+    expect(pickPhantomCushionSlot([8], getDay, ["E5"], ["E5"], noContinuity)).toBeNull();
+  });
+});
+
+describe("pickPhantomPermanentSwap", () => {
+  const noContinuity = () => false;
+  const allowedShiftsByEmp = { 100: ["E3", "E5", "E7"], 101: ["E5", "E7"] };
+  const getAllowedShifts = (empId) => allowedShiftsByEmp[empId];
+  const days = {
+    // donor (100) has E5, and a genuine hole (E3) they're trained for
+    a: { assignment: { E5: { type: "permanent", empId: 100, fixed: false } }, holes: ["E3"] },
+    // donor (100) has E5, but nothing but E0 is available that day
+    b: { assignment: { E5: { type: "permanent", empId: 100, fixed: false } }, holes: [] },
+    // donor (100) has E5, no hole, but a PRN's E3 they're trained for
+    c: { assignment: { E5: { type: "permanent", empId: 100, fixed: false }, E3: { type: "extra", fixed: false } }, holes: [] },
+    // donor's only open hole is one they aren't trained for
+    d: { assignment: { E5: { type: "permanent", empId: 100, fixed: false } }, holes: ["E9"] },
+    // E5 is a fixed (continuity/weekend-pairing) commitment — never touched
+    e: { assignment: { E5: { type: "permanent", empId: 100, fixed: true } }, holes: ["E3"] },
+    // donor's only open hole (E7) is itself continuity-coded
+    f: { assignment: { E5: { type: "permanent", empId: 100, fixed: false } }, holes: ["E7"] },
+  };
+  const getDay = (dayIdx) => days[dayIdx];
+
+  test("returns null when no cushion codes are configured", () => {
+    expect(pickPhantomPermanentSwap(["a"], getDay, ["E5"], [], 999, getAllowedShifts, noContinuity)).toBeNull();
+  });
+
+  test("takes the cushion code in exchange for a genuine hole the donor is trained for", () => {
+    expect(pickPhantomPermanentSwap(["a"], getDay, ["E5"], ["E5"], 999, getAllowedShifts, noContinuity))
+      .toEqual({ dayIdx: "a", code: "E5", donorId: 100, replacementCode: "E3" });
+  });
+
+  test("refuses when the only thing left for the donor would be E0", () => {
+    expect(pickPhantomPermanentSwap(["b"], getDay, ["E5"], ["E5"], 999, getAllowedShifts, noContinuity)).toBeNull();
+  });
+
+  test("falls back to a PRN-covered shift for the donor when there's no hole", () => {
+    expect(pickPhantomPermanentSwap(["c"], getDay, ["E5"], ["E5"], 999, getAllowedShifts, noContinuity))
+      .toEqual({ dayIdx: "c", code: "E5", donorId: 100, replacementCode: "E3" });
+  });
+
+  test("never hands the donor a hole they aren't trained for", () => {
+    expect(pickPhantomPermanentSwap(["d"], getDay, ["E5"], ["E5"], 999, getAllowedShifts, noContinuity)).toBeNull();
+  });
+
+  test("never touches a fixed (continuity/weekend-pairing) cushion commitment", () => {
+    expect(pickPhantomPermanentSwap(["e"], getDay, ["E5"], ["E5"], 999, getAllowedShifts, noContinuity)).toBeNull();
+  });
+
+  test("never steals a continuity-coded cushion shift even when it isn't marked fixed", () => {
+    const isContinuityCode = (code) => code === "E5";
+    expect(pickPhantomPermanentSwap(["a"], getDay, ["E5"], ["E5"], 999, getAllowedShifts, isContinuityCode)).toBeNull();
+  });
+
+  test("never hands the donor a replacement hole that's itself continuity-coded", () => {
+    const isContinuityCode = (code) => code === "E7";
+    expect(pickPhantomPermanentSwap(["f"], getDay, ["E5"], ["E5"], 999, getAllowedShifts, isContinuityCode)).toBeNull();
+  });
+
+  test("never swaps with the flagged employee themself", () => {
+    expect(pickPhantomPermanentSwap(["a"], getDay, ["E5"], ["E5"], 100, getAllowedShifts, noContinuity)).toBeNull();
   });
 });
 

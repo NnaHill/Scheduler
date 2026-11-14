@@ -85,6 +85,94 @@ export function nextOverflowKey(dayAssignment) {
   while (`${OVERFLOW_CODE}#${n}` in dayAssignment) n++;
   return `${OVERFLOW_CODE}#${n}`;
 }
+
+// A PRN entry on `dayIdx` this employee could take over: trained for
+// it, and never a fixed or continuity commitment (displacing either
+// would break a multi-day commitment the same way dragging onto it
+// would). `onlyCodes`, if given, restricts the match to those codes.
+// `getDay(dayIdx)` returns `{ assignment }` (a wider shape is fine —
+// only `assignment` is read here).
+function stealablePrnEntry(getDay, allowedShifts, isContinuityCode, dayIdx, onlyCodes) {
+  const { assignment } = getDay(dayIdx);
+  return Object.entries(assignment).find(([code, info]) => {
+    const base = overflowBaseCode(code);
+    return info.type === "extra" && !info.fixed && !isOverflowKey(code) && !isContinuityCode(base)
+      && allowedShifts.includes(base) && (!onlyCodes || onlyCodes.includes(base));
+  });
+}
+
+// Which day/cushion-code a phantom "needs manual coverage" flag should
+// use, among a pay period's open candidate days, before falling back
+// to anything more disruptive: first, a PRN already covering one of
+// the manager's chosen "cushion" codes (e.g. a float role, usually
+// lighter) — the easiest version of this shortfall to cover — and
+// failing that, a cushion code nobody's using at all that day, claimed
+// directly (never overwriting someone else's real shift, and never a
+// code that isn't actually active that day — a weekday-only cushion
+// code offered on a weekend/holiday, or vice versa, would otherwise
+// look "open" simply because nobody needed it there in the first
+// place). `getDay(dayIdx)` returns `{ assignment, activeShifts }`.
+// Returns null when neither option exists anywhere in the block, or
+// when no cushion codes are configured.
+export function pickPhantomCushionSlot(candidateDayIndices, getDay, allowedShifts, cushionCodes, isContinuityCode) {
+  if (!cushionCodes || !cushionCodes.length) return null;
+  for (const dayIdx of candidateDayIndices) {
+    const hit = stealablePrnEntry(getDay, allowedShifts, isContinuityCode, dayIdx, cushionCodes);
+    if (hit) return { dayIdx, code: hit[0] };
+  }
+  for (const dayIdx of candidateDayIndices) {
+    const { assignment, activeShifts } = getDay(dayIdx);
+    const code = cushionCodes.find((c) => allowedShifts.includes(c) && !isContinuityCode(c) && !(c in assignment) && activeShifts.includes(c));
+    if (code) return { dayIdx, code };
+  }
+  return null;
+}
+
+// Takes a manager's chosen cushion code from a PERMANENT employee for
+// a phantom flag, when there's no PRN to take it from and no open
+// slot to claim directly — but only when that employee can be handed
+// something REAL in exchange on the exact same day: a genuine hole,
+// or a PRN-covered shift they're trained for. Never a bare E0 filler,
+// which would just move the same placeholder problem onto someone
+// else instead of solving it, and never a fixed/continuity donor
+// shift, same as everywhere else this would break a commitment.
+// `getDay(dayIdx)` returns `{ assignment, holes }`; `getAllowedShifts`
+// looks up a donor's training by empId. Returns `{ dayIdx, code,
+// donorId, replacementCode }` for the caller to actually apply both
+// halves of the swap, or null when no day in the block qualifies.
+export function pickPhantomPermanentSwap(candidateDayIndices, getDay, allowedShifts, cushionCodes, excludeEmpId, getAllowedShifts, isContinuityCode) {
+  if (!cushionCodes || !cushionCodes.length) return null;
+  for (const dayIdx of candidateDayIndices) {
+    const { assignment, holes } = getDay(dayIdx);
+    for (const code of cushionCodes) {
+      if (!allowedShifts.includes(code) || isContinuityCode(code)) continue;
+      const entry = assignment[code];
+      if (!entry || entry.type !== "permanent" || entry.fixed || entry.empId === excludeEmpId) continue;
+      const donorAllowed = getAllowedShifts(entry.empId);
+      if (!donorAllowed) continue;
+      const holeCode = holes.find((hc) => donorAllowed.includes(hc) && !isContinuityCode(hc));
+      const prnEntry = !holeCode && Object.entries(assignment).find(([c, info]) =>
+        info.type === "extra" && !info.fixed && donorAllowed.includes(c) && !isContinuityCode(c));
+      if (!holeCode && !prnEntry) continue;
+      return { dayIdx, code, donorId: entry.empId, replacementCode: holeCode || prnEntry[0] };
+    }
+  }
+  return null;
+}
+
+// Last resort before a plain E0 placeholder: take over ANY PRN's real
+// shift, cushion or not — still real work beats inventing a
+// placeholder on top of everything else. Same fixed/continuity
+// exclusions as pickPhantomCushionSlot. `getDay(dayIdx)` returns
+// `{ assignment }` — stealing an existing entry is always safe, since
+// it was only ever placed there if it was actually active that day.
+export function pickPhantomAnySteal(candidateDayIndices, getDay, allowedShifts, isContinuityCode) {
+  for (const dayIdx of candidateDayIndices) {
+    const hit = stealablePrnEntry(getDay, allowedShifts, isContinuityCode, dayIdx, null);
+    if (hit) return { dayIdx, code: hit[0] };
+  }
+  return null;
+}
 // Which days to top up so an extended-hour employee actually reaches
 // their guaranteed shift count for every pay period, not just stays under
 // the ceiling. Pay periods are fixed, non-overlapping windowDays-long
