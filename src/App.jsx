@@ -1918,8 +1918,18 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // Soft, non-blocking heads-up for a swap that puts someone somewhere the
   // auto-generated schedule never would have — same philosophy as every
   // other "preference" in this app: tell the manager, don't stop them.
-  const manualEditWarning = (newDays, emp, dayIdx, newCode) => {
-    if (!newCode) return [];
+  // Also the GIVER's side of a move: `oldCode` is what they had on this
+  // day before the drag. If they end up with nothing (`newCode` falsy)
+  // and they had a real shift before, their shift count just went down
+  // one — flag that here too, not just on the receiving end, so a move
+  // that quietly leaves someone short doesn't only get a warning when
+  // the person who GAINED the shift happens to trip a cap/training rule.
+  const manualEditWarning = (newDays, emp, dayIdx, newCode, oldCode) => {
+    if (!newCode) {
+      if (!oldCode) return [];
+      const newTotal = newDays.filter((d) => Object.values(d.assignment).some((a) => a.empId === emp.id)).length;
+      return [`${emp.name} lost their ${shiftLabel(oldCode)} shift here with nothing given back — down to ${newTotal} shift${newTotal === 1 ? "" : "s"} total now.`];
+    }
     const warnings = [];
     if (!emp.allowedShifts.includes(newCode)) warnings.push(`${emp.name} isn't trained on ${shiftLabel(newCode)}.`);
     if (emp.type === "permanent") {
@@ -2047,8 +2057,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       }
 
       setManualEditWarnings([
-        ...manualEditWarning(workingDays, empA, dayIdxA, codeB),
-        ...manualEditWarning(workingDays, empB, dayIdxB, codeA),
+        ...manualEditWarning(workingDays, empA, dayIdxA, codeB, codeA),
+        ...manualEditWarning(workingDays, empB, dayIdxB, codeA, codeB),
       ]);
       return recomputeAndPersistSchedule(prev, workingDays);
     });
