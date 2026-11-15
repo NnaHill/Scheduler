@@ -1892,11 +1892,46 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const { days: searchedDays, finalCost: costAfter } = localSearch(initialDays, 2500);
       const optimizedDays = applyMinimumShiftGuarantees(searchedDays.map((d) => ({ ...d, holes: holesOnDay(d) })));
 
+      // The optimizer (localSearch's fairness-balancing swaps, and the
+      // guarantee top-up's PRN displacement) can hand someone's shift to
+      // a different person without the two trading anything back — the
+      // same kind of loss a manual drag can cause, just made internally
+      // across thousands of trial moves instead of one click. Comparing
+      // the day-walk's first pass (initialDays, before any of that ran)
+      // against the final result finds every day that changed hands this
+      // way, regardless of which internal move caused it.
+      //
+      // Only worth flagging when it actually cost someone a NET shift,
+      // though — across 2500 local-search trials it's common for someone
+      // to lose one day's shift but pick up a different one elsewhere in
+      // the same pass, landing at the same total. That's just their days
+      // reshuffling, not a loss, so it's excluded here: only employees
+      // whose final total is actually lower than where the day-walk first
+      // left them get reported, same bar the manual-drag warning uses
+      // (its own "down to N shifts" message).
+      const empList = [...permanent, ...extra];
+      const totalWorked = (daysArr, empId) => daysArr.filter((d) => Object.values(d.assignment).some((a) => a.empId === empId)).length;
+      const autoRearrangedLosses = [];
+      const autoKickedOutCells = new Set();
+      empList.forEach((e) => {
+        const initialTotal = totalWorked(initialDays, e.id);
+        const finalTotal = totalWorked(optimizedDays, e.id);
+        if (finalTotal >= initialTotal) return;
+        days.forEach((day) => {
+          const before = Object.entries(initialDays[day.idx].assignment).find(([, info]) => info.empId === e.id);
+          if (!before) return;
+          const stillHas = Object.values(optimizedDays[day.idx].assignment).some((info) => info.empId === e.id);
+          if (stillHas) return;
+          autoRearrangedLosses.push(`${e.name} had ${shiftLabel(before[0])} on ${day.wd} ${day.md} before the generator reassigned it elsewhere — down to ${finalTotal} shifts total now (was ${initialTotal}).`);
+          autoKickedOutCells.add(key(e.id, day.idx));
+        });
+      });
+
       const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts, weekendPairingEnabled, extendOffWeekends, cushionShiftCodes };
-      const scheduleSnapshot = { settingsUsed, costBefore, costAfter, iterations: 2500, numWeeks, startDate, forcedHolidayConflicts: forcedConflicts, pinnedShiftConflicts: pinnedConflicts, pinnedShiftWarnings: pinnedWarnings, ...buildScheduleDerived(optimizedDays) };
+      const scheduleSnapshot = { settingsUsed, costBefore, costAfter, iterations: 2500, numWeeks, startDate, forcedHolidayConflicts: forcedConflicts, pinnedShiftConflicts: pinnedConflicts, pinnedShiftWarnings: pinnedWarnings, autoRearrangedLosses, ...buildScheduleDerived(optimizedDays) };
       setSchedule(scheduleSnapshot);
       setManualEditWarnings([]);
-      setKickedOutCells(new Set());
+      setKickedOutCells(autoKickedOutCells);
       saveScheduleSnapshot(scheduleSnapshot, viewingOwnerId).catch(reportSyncError);
       setGenerating(false);
       setTab("schedule");
@@ -1947,7 +1982,21 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // capped) safe on pay-period cap and the consecutive-day limit. Used
   // to backfill the slot a drag just vacated, not to assign the drag's
   // destination (that's still exactly what the manager dropped).
-  const findReplacementForSlot = (workingDays, dayIdx, code, excludeEmpId) => {
+  //
+  // Three tiers, each a step more disruptive than the last:
+  //  1. Someone completely free that day — nobody else is touched.
+  //  2. Someone who already holds this EXACT code within a few days
+  //     either way, relocated here instead of calling in someone new —
+  //     see findRelocatableHolder. The caller still has to flag (not
+  //     fill) the fresh gap this opens on their old day, so a chain of
+  //     "who's short" stays visible instead of a brand-new PRN quietly
+  //     appearing to paper over it.
+  //  3. A free PRN, same last resort as before.
+  // `protectedDayIndices` keeps tier 2 from reaching into a day this
+  // same swap is already editing (dayIdxA/dayIdxB) — that day's clone is
+  // still held by a local variable elsewhere in applyManualSwap, and
+  // relocating out of it here would silently re-clone over those edits.
+  const findReplacementForSlot = (workingDays, dayIdx, code, excludeEmpId, protectedDayIndices = []) => {
     const day = workingDays[dayIdx];
     const used = new Set(Object.values(day.assignment).map((a) => a.empId));
     const perm = permanent.find((p) => p.id !== excludeEmpId && !used.has(p.id) && p.allowedShifts.includes(code)
@@ -1956,8 +2005,57 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       && !wouldExceedShiftCap(p, workedDayIndicesFromSchedule(workingDays, p.id), [dayIdx], capForBlock(p))
       && !(consecutiveHardLimit && wouldExceedConsecutiveDays(workedDayIndicesFromSchedule(workingDays, p.id), [dayIdx], maxConsecutiveDays)));
     if (perm) return { empId: perm.id, type: "permanent" };
+    const relocated = findRelocatableHolder(workingDays, dayIdx, code, excludeEmpId, used, protectedDayIndices);
+    if (relocated) return relocated;
     const ex = extra.find((x) => x.id !== excludeEmpId && !used.has(x.id) && x.allowedShifts.includes(code) && extraAvailable[key(x.id, dayIdx)]);
     return ex ? { empId: ex.id, type: "extra" } : null;
+  };
+
+  // Tier 2 of findReplacementForSlot: searches outward (closest day
+  // first, alternating before/after) up to RELOCATE_WINDOW days either
+  // side of `dayIdx` for someone — permanent checked before PRN — who
+  // already has `code` there and could safely be moved to `dayIdx`
+  // instead. Only ever bumps an OVERFLOW (E0) filler already sitting on
+  // `dayIdx`, never a second real shift, and never pulls from a fixed,
+  // override, or protected day. Returns `relocatedFromDayIdx` so the
+  // caller can clear that day and flag the gap it just created.
+  const RELOCATE_WINDOW = 3;
+  const findRelocatableHolder = (workingDays, dayIdx, code, excludeEmpId, usedOnTargetDay, protectedDayIndices) => {
+    const targetDay = workingDays[dayIdx];
+    const searchOrder = [];
+    for (let offset = 1; offset <= RELOCATE_WINDOW; offset++) {
+      if (dayIdx - offset >= 0) searchOrder.push(dayIdx - offset);
+      if (dayIdx + offset < workingDays.length) searchOrder.push(dayIdx + offset);
+    }
+    for (const [list, type] of [[permanent, "permanent"], [extra, "extra"]]) {
+      for (const otherIdx of searchOrder) {
+        if (protectedDayIndices.includes(otherIdx)) continue;
+        const otherDay = workingDays[otherIdx];
+        const entry = Object.entries(otherDay.assignment).find(([c, info]) => c === code && info.type === type);
+        if (!entry) continue;
+        const [, info] = entry;
+        if (info.empId === excludeEmpId || info.fixed || info.override) continue;
+        const candidate = list.find((p) => p.id === info.empId);
+        if (!candidate) continue;
+        const bumpedOverflowKey = Object.entries(targetDay.assignment).find(([c, i]) => isOverflowKey(c) && i.empId === candidate.id)?.[0];
+        if (usedOnTargetDay.has(candidate.id) && !bumpedOverflowKey) continue;
+        if (ptoStatus[key(candidate.id, dayIdx)] === "PTO1" || ptoStatus[key(candidate.id, dayIdx)] === "PTO2") continue;
+        if (!respectsFixedDayRestriction(candidate, [targetDay.dow])) continue;
+        if (type === "permanent") {
+          // Excludes both the day they're being pulled FROM (that day's
+          // about to stop counting for them) and `dayIdx` itself — if
+          // they're already on `dayIdx` via an overflow filler (the only
+          // way usedOnTargetDay lets a candidate through at all), it's
+          // already in workedDayIndicesFromSchedule and would otherwise
+          // get double-counted once more as the "proposed" day below.
+          const existingWorked = workedDayIndicesFromSchedule(workingDays, candidate.id).filter((idx) => idx !== otherIdx && idx !== dayIdx);
+          if (wouldExceedShiftCap(candidate, existingWorked, [dayIdx], capForBlock(candidate))) continue;
+          if (consecutiveHardLimit && wouldExceedConsecutiveDays(existingWorked, [dayIdx], maxConsecutiveDays)) continue;
+        } else if (!extraAvailable[key(candidate.id, dayIdx)]) continue;
+        return { empId: candidate.id, type, relocatedFromDayIdx: otherIdx, bumpedOverflowKey };
+      }
+    }
+    return null;
   };
 
   // Save slots: a deliberate snapshot of whatever's currently on screen
@@ -2029,14 +2127,33 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       // never has to show a fresh hole just because one shift moved —
       // left as a real hole (for the "Fill a coverage gap" card) only
       // when nobody safe is free.
+      //
+      // Tier 2 of that search (see findReplacementForSlot) can RELOCATE
+      // someone who already holds this code on a nearby day instead of
+      // calling in someone new — that opens a fresh gap on the day
+      // they're pulled FROM, which gets cleared and flagged here right
+      // alongside the original one, same badge and warning pipeline.
+      // Never auto-filled further: the manager resolves it by hand, so
+      // the chain of "who's short" stays visible instead of silently
+      // cascading.
+      const relocationLosses = [];
+      const applyReplacement = (targetDay, code, replacement) => {
+        if (replacement.bumpedOverflowKey) delete targetDay.assignment[replacement.bumpedOverflowKey];
+        targetDay.assignment[code] = { empId: replacement.empId, type: replacement.type, override: false, fixed: false, manual: true };
+        if (replacement.relocatedFromDayIdx == null) return;
+        const otherDay = cloneDay(replacement.relocatedFromDayIdx);
+        delete otherDay.assignment[code];
+        otherDay.holes = holesOnDay(otherDay);
+        relocationLosses.push({ empId: replacement.empId, dayIdx: replacement.relocatedFromDayIdx, code });
+      };
       if (dayIdxA !== dayIdxB) {
         if (codeA && !codeB) {
-          const replacement = findReplacementForSlot(workingDays, dayIdxA, codeA, empA.id);
-          if (replacement) dayA.assignment[codeA] = { ...replacement, override: false, fixed: false, manual: true };
+          const replacement = findReplacementForSlot(workingDays, dayIdxA, codeA, empA.id, [dayIdxA, dayIdxB]);
+          if (replacement) applyReplacement(dayA, codeA, replacement);
         }
         if (codeB && !codeA) {
-          const replacement = findReplacementForSlot(workingDays, dayIdxB, codeB, empB.id);
-          if (replacement) dayB.assignment[codeB] = { ...replacement, override: false, fixed: false, manual: true };
+          const replacement = findReplacementForSlot(workingDays, dayIdxB, codeB, empB.id, [dayIdxA, dayIdxB]);
+          if (replacement) applyReplacement(dayB, codeB, replacement);
         }
       }
       dayA.holes = holesOnDay(dayA);
@@ -2046,19 +2163,28 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       // day and nothing comes back — dragging your OWN shift to a new
       // day (empA === empB) isn't a loss, just a relocation; the old
       // day either gets backfilled or shows as a real hole, both
-      // already visible on their own.
-      if (empA.id !== empB.id) {
-        setKickedOutCells((prev) => {
-          const next = new Set(prev);
+      // already visible on their own. A relocation loss (above) always
+      // flags, regardless: it's always a different, third employee.
+      setKickedOutCells((prev) => {
+        const next = new Set(prev);
+        if (empA.id !== empB.id) {
           if (codeA && !codeB) next.add(key(empA.id, dayIdxA));
           if (codeB && !codeA) next.add(key(empB.id, dayIdxB));
-          return next;
-        });
-      }
+        }
+        relocationLosses.forEach(({ empId, dayIdx }) => next.add(key(empId, dayIdx)));
+        return next;
+      });
+
+      const relocationWarnings = relocationLosses.map(({ empId, dayIdx, code }) => {
+        const who = [...permanent, ...extra].find((p) => p.id === empId);
+        const d = days[dayIdx];
+        return `${who?.name || "Someone"}'s ${shiftLabel(code)} shift on ${d.wd} ${d.md} was moved to cover the gap this opened up — that day needs covering now instead.`;
+      });
 
       setManualEditWarnings([
         ...manualEditWarning(workingDays, empA, dayIdxA, codeB, codeA),
         ...manualEditWarning(workingDays, empB, dayIdxB, codeA, codeB),
+        ...relocationWarnings,
       ]);
       return recomputeAndPersistSchedule(prev, workingDays);
     });
@@ -2282,7 +2408,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                         border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : pinned ? "3px solid #2563EB" : forcedHoliday ? "3px dashed #2563EB" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : kickedOut ? "2px dashed #F59E0B" : "none",
                         cursor: draggable ? "grab" : droppable ? "copy" : "default",
                       }}
-                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : pinned ? "Manually pinned — you chose this exact shift for this day, and the rest of the schedule was built around it." : forcedHoliday ? "Forced holiday work — scheduled here to cover sparse holiday staffing even though it's normally their day off." : kickedOut ? `${emp.name} had a real shift here before a drag gave this day to someone else, with nothing given back — they may now be short. Assign them something else if they still need to hit their target.` : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
+                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : pinned ? "Manually pinned — you chose this exact shift for this day, and the rest of the schedule was built around it." : forcedHoliday ? "Forced holiday work — scheduled here to cover sparse holiday staffing even though it's normally their day off." : kickedOut ? `${emp.name} had a real shift here before it was handed to someone else — a drag, or the generator's own rearrangement — with nothing given back. They may now be short; assign them something else if they still need to hit their target.` : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
                       draggable={draggable}
                       onDragStart={draggable ? (e) => { e.dataTransfer.setData("application/json", JSON.stringify({ empId: emp.id, dayIdx: d.idx })); e.dataTransfer.effectAllowed = "move"; } : undefined}
                       onDragOver={droppable ? (e) => e.preventDefault() : undefined}
@@ -2520,6 +2646,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li>An amber banner reading "couldn't be paired to the same person" means weekend pairing (see Permanent Staff above) couldn't find anyone free both Saturday and Sunday for that shift — it's a heads-up, not an error, and it tells you exactly which weekend to check.</li>
                   <li><b>Shifts column</b> (left of Employee) — shows their running total for the whole schedule over their extended-hour cap (scaled up to the schedule's full length), live. Swap two people's shifts and both numbers move at once — one up, one down. It turns red if any single pay period actually goes over the cap (hover the cell for the exact numbers) — that's your real "am I overloading anyone" checkpoint, separate from the total just ticking up or down.</li>
                   <li><b>Drag any shift cell onto another to swap them by hand.</b> If the cell you drop onto already had a shift, both people trade places. If it was empty, that person just gains the shift — the person you dragged FROM loses that day with nothing given back, and an amber dashed cell with a "−" badge marks exactly where, so you can see at a glance who might now be short and reassign them if they still need to hit their target. A small teal dot marks any cell you've moved. Fairness Report, Optimization, and Export CSV all update to match immediately. A continuity shift can't be dragged or dropped onto (it's a locked multi-day block), and neither can someone's approved PTO-1 leave day. If a swap puts someone on a shift they're not trained for or over a limit, you'll get an amber warning banner — it still goes through, since it's your call, but you'll know.</li>
+                  <li>The same "−" badge (and an amber banner right after generating) also fires when <b>Generate/Regenerate itself</b> hands someone's shift to someone else with nothing given back — the optimizer does this internally while balancing fairness, same as a drag would, just without you clicking anything. Both causes look and read the same way, since the fix is the same either way: reassign them something else if they still need it.</li>
                   <li>Dragging someone <i>away</i> from a day they were covering, onto a day where the other person wasn't working, leaves their original day empty — that's not a bug. Nobody automatically backfills it, so it shows up honestly as a new Coverage gap instead of silently vanishing.</li>
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
                   <li><b>Export CSV</b> turns it into a spreadsheet, including any manual swaps or gap-fills you've made. <b>Regenerate</b> reruns the optimizer from scratch if you want another pass — this discards any manual edits.</li>
@@ -3350,6 +3477,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 ℹ {schedule.pinnedShiftWarnings.length} pinned shift(s) scheduled for someone not trained on that code: {schedule.pinnedShiftWarnings.join(" ")}
               </div>
             )}
+            {schedule.autoRearrangedLosses?.length > 0 && (
+              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
+                ⚠ {schedule.autoRearrangedLosses.length} shift(s) were handed to someone else during generation, leaving the original person short — look for the dashed amber "−" cells below: {schedule.autoRearrangedLosses.join(" ")}
+              </div>
+            )}
             {manualEditWarnings.length > 0 && (
               <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2 flex items-start justify-between gap-3">
                 <span>⚠ After your last move: {manualEditWarnings.join(" ")}</span>
@@ -3424,7 +3556,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#F59E0B]" />PTO-2</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ border: "3px dashed #2563EB" }} />forced holiday work</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ border: "3px solid #2563EB" }} />manually pinned shift</div>
-              <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" style={{ border: "2px dashed #F59E0B" }} />lost a shift to a drag (now likely short)</div>
+              <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" style={{ border: "2px dashed #F59E0B" }} />lost a shift with nothing given back (now likely short)</div>
               <div className="ml-auto flex items-center gap-2">
                 {[1, 2].map((slot) => (
                   <div key={slot} className="flex items-center gap-1">
