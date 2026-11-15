@@ -94,6 +94,12 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // needs-coverage flag, when there's a choice of which one to take.
   const [cushionShiftCodes, setCushionShiftCodes] = useState([]);
   const [manualEditWarnings, setManualEditWarnings] = useState([]);
+  // Cells that held a real shift before a manual drag and now sit empty
+  // because a DIFFERENT employee ended up with that day instead, with
+  // nothing handed back — i.e. that employee is now genuinely short one
+  // shift, not just relocated. Session-only (reset on regenerate); a
+  // cell clears itself the moment it holds a real assignment again.
+  const [kickedOutCells, setKickedOutCells] = useState(() => new Set());
   const [employees, setEmployees] = useState([]);
   const [ptoStatus, setPtoStatus] = useState({});
   const [ptoSource, setPtoSource] = useState({}); // key -> 'manual' | 'weekend_rotation'
@@ -1754,6 +1760,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const scheduleSnapshot = { settingsUsed, costBefore, costAfter, iterations: 2500, numWeeks, startDate, forcedHolidayConflicts: forcedConflicts, ...buildScheduleDerived(optimizedDays) };
       setSchedule(scheduleSnapshot);
       setManualEditWarnings([]);
+      setKickedOutCells(new Set());
       saveScheduleSnapshot(scheduleSnapshot, viewingOwnerId).catch(reportSyncError);
       setGenerating(false);
       setTab("schedule");
@@ -1862,6 +1869,20 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       }
       dayA.holes = holesOnDay(dayA);
       dayB.holes = holesOnDay(dayB);
+
+      // Only a genuine loss when a DIFFERENT employee ends up with the
+      // day and nothing comes back — dragging your OWN shift to a new
+      // day (empA === empB) isn't a loss, just a relocation; the old
+      // day either gets backfilled or shows as a real hole, both
+      // already visible on their own.
+      if (empA.id !== empB.id) {
+        setKickedOutCells((prev) => {
+          const next = new Set(prev);
+          if (codeA && !codeB) next.add(key(empA.id, dayIdxA));
+          if (codeB && !codeA) next.add(key(empB.id, dayIdxB));
+          return next;
+        });
+      }
 
       setManualEditWarnings([
         ...manualEditWarning(workingDays, empA, dayIdxA, codeB),
@@ -2075,6 +2096,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 const { code, override, manual, phantom, forcedHoliday } = cellFor(emp, d);
                 const isShift = ALL_SHIFT_CODES.includes(code);
                 const displayText = code === "OFF" ? "" : isShift ? shiftLabel(code) : code;
+                const kickedOut = code === "OFF" && kickedOutCells.has(key(emp.id, d.idx));
                 const bg = isShift ? getShiftColor(code) : (code === "PTO-1" || code === "WKND") ? "#DC2626" : code === "PTO-2" ? "#F59E0B" : code === "OFF" ? "#E4E7EC" : "transparent";
                 const fg = isShift || code === "PTO-1" || code === "WKND" || code === "PTO-2" ? "#fff" : "#64748B";
                 const draggable = canDragCell(code);
@@ -2085,10 +2107,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       className={phantom ? "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold animate-pulse" : "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"}
                       style={{
                         background: bg, color: fg, fontSize: gridCellFontSize(displayText),
-                        border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : forcedHoliday ? "3px dashed #2563EB" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : "none",
+                        border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : forcedHoliday ? "3px dashed #2563EB" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : kickedOut ? "2px dashed #F59E0B" : "none",
                         cursor: draggable ? "grab" : droppable ? "copy" : "default",
                       }}
-                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : forcedHoliday ? "Forced holiday work — scheduled here to cover sparse holiday staffing even though it's normally their day off." : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
+                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : forcedHoliday ? "Forced holiday work — scheduled here to cover sparse holiday staffing even though it's normally their day off." : kickedOut ? `${emp.name} had a real shift here before a drag gave this day to someone else, with nothing given back — they may now be short. Assign them something else if they still need to hit their target.` : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
                       draggable={draggable}
                       onDragStart={draggable ? (e) => { e.dataTransfer.setData("application/json", JSON.stringify({ empId: emp.id, dayIdx: d.idx })); e.dataTransfer.effectAllowed = "move"; } : undefined}
                       onDragOver={droppable ? (e) => e.preventDefault() : undefined}
@@ -2106,6 +2128,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       {manual && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[#0D9488] border border-white" />}
                       {phantom && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#DC2626] border border-white text-white text-[8px] leading-3 font-bold">!</span>}
                       {forcedHoliday && !phantom && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#2563EB] border border-white text-white text-[7px] leading-3 font-bold">H</span>}
+                      {kickedOut && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#F59E0B] border border-white text-white text-[8px] leading-3 font-bold">−</span>}
                     </div>
                   </td>
                 );
@@ -2321,7 +2344,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li>A pulsing red <b>HOLE</b> badge means that shift couldn't be filled — hover it to see which shift and why.</li>
                   <li>An amber banner reading "couldn't be paired to the same person" means weekend pairing (see Permanent Staff above) couldn't find anyone free both Saturday and Sunday for that shift — it's a heads-up, not an error, and it tells you exactly which weekend to check.</li>
                   <li><b>Shifts column</b> (left of Employee) — shows their running total for the whole schedule over their extended-hour cap (scaled up to the schedule's full length), live. Swap two people's shifts and both numbers move at once — one up, one down. It turns red if any single pay period actually goes over the cap (hover the cell for the exact numbers) — that's your real "am I overloading anyone" checkpoint, separate from the total just ticking up or down.</li>
-                  <li><b>Drag any shift cell onto another to swap them by hand.</b> Both people trade places — nobody just disappears. A small teal dot marks a cell you've moved. Fairness Report, Optimization, and Export CSV all update to match immediately. A continuity shift can't be dragged or dropped onto (it's a locked multi-day block), and neither can someone's approved PTO-1 leave day. If a swap puts someone on a shift they're not trained for or over a limit, you'll get an amber warning — it still goes through, since it's your call, but you'll know.</li>
+                  <li><b>Drag any shift cell onto another to swap them by hand.</b> If the cell you drop onto already had a shift, both people trade places. If it was empty, that person just gains the shift — the person you dragged FROM loses that day with nothing given back, and an amber dashed cell with a "−" badge marks exactly where, so you can see at a glance who might now be short and reassign them if they still need to hit their target. A small teal dot marks any cell you've moved. Fairness Report, Optimization, and Export CSV all update to match immediately. A continuity shift can't be dragged or dropped onto (it's a locked multi-day block), and neither can someone's approved PTO-1 leave day. If a swap puts someone on a shift they're not trained for or over a limit, you'll get an amber warning banner — it still goes through, since it's your call, but you'll know.</li>
                   <li>Dragging someone <i>away</i> from a day they were covering, onto a day where the other person wasn't working, leaves their original day empty — that's not a bug. Nobody automatically backfills it, so it shows up honestly as a new Coverage gap instead of silently vanishing.</li>
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
                   <li><b>Export CSV</b> turns it into a spreadsheet, including any manual swaps or gap-fills you've made. <b>Regenerate</b> reruns the optimizer from scratch if you want another pass — this discards any manual edits.</li>
@@ -3125,7 +3148,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               </div>
             )}
             <div className="bg-[#EFF6FF] border border-[#BFDBFE] text-[#1E3A8A] text-xs rounded px-3 py-2">
-              ✋ Drag any shift cell onto another to swap them by hand — a small teal dot marks a cell you've moved. Fairness Report, Optimization, and Export CSV all update to match. Locked-leave days and continuity shifts can't be dragged onto or moved.
+              ✋ Drag any shift cell onto another to swap them by hand — a small teal dot marks a cell you've moved. Dropping onto an empty cell moves the shift instead of swapping it; an amber dashed cell with a "−" marks wherever that leaves someone short. Fairness Report, Optimization, and Export CSV all update to match. Locked-leave days and continuity shifts can't be dragged onto or moved.
             </div>
             {(gapsList.length > 0 || overflowDaysList.length > 0) && (
               <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
@@ -3191,6 +3214,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#DC2626]" style={{ border: "2px dashed #7C3AED" }} />WKND (off per rotation, not leave)</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#F59E0B]" />PTO-2</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ border: "3px dashed #2563EB" }} />forced holiday work</div>
+              <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" style={{ border: "2px dashed #F59E0B" }} />lost a shift to a drag (now likely short)</div>
               <button
                 onClick={() => downloadScheduleCsv({ schedule, permanent, extra, ptoStatus, ptoSource, holidays, key, shiftLabel }, `schedule_${startDate}_${numWeeks}w.csv`)}
                 className="ml-auto px-3 py-1.5 text-xs font-semibold rounded border border-[#0D9488] text-[#0D9488] hover:bg-[#0D9488] hover:text-white"
