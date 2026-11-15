@@ -215,6 +215,37 @@ export async function bulkDeleteForcedHolidayWork(employeeId, startIso, endIso, 
   if (error) throw error;
 }
 
+// Manual shift pins — a manager hand-writes a specific shift code for a
+// specific employee on a specific date, which the generator locks in
+// before building everything else around it. Per-cell only (unlike
+// PTO/forced-holiday there's no bulk date-range tool for this), so just
+// single-row upsert/delete alongside the range fetch.
+export async function fetchPinnedShifts(startIso, endIso, ownerId) {
+  const { data, error } = await supabase
+    .from("pinned_shifts")
+    .select("employee_id, day_iso, code")
+    .eq("owner_id", ownerId)
+    .gte("day_iso", startIso)
+    .lte("day_iso", endIso);
+  if (error) throw error;
+  return data;
+}
+export async function upsertPinnedShift(employeeId, iso, code, ownerId) {
+  const { error } = await supabase
+    .from("pinned_shifts")
+    .upsert({ employee_id: employeeId, day_iso: iso, code, owner_id: ownerId }, { onConflict: "employee_id,day_iso" });
+  if (error) throw error;
+}
+export async function deletePinnedShift(employeeId, iso, ownerId) {
+  const { error } = await supabase
+    .from("pinned_shifts")
+    .delete()
+    .eq("employee_id", employeeId)
+    .eq("owner_id", ownerId)
+    .eq("day_iso", iso);
+  if (error) throw error;
+}
+
 export async function fetchExtraAvailability(startIso, endIso, ownerId) {
   const { data, error } = await supabase
     .from("extra_availability")
@@ -270,4 +301,22 @@ export async function fetchScheduleSnapshot(ownerId) {
   const { data, error } = await supabase.from("saved_schedules").select("snapshot").eq("owner_id", ownerId).maybeSingle();
   if (error) throw error;
   return data?.snapshot || null;
+}
+
+// Two named save slots per manager (1 and 2) — unlike saved_schedules
+// above (which silently tracks whatever's on screen), a slot only changes
+// when the manager explicitly saves into it, so it's safe to keep a
+// schedule around to compare against or fall back to later.
+export async function fetchScheduleSlots(ownerId) {
+  const { data, error } = await supabase.from("schedule_save_slots").select("slot, snapshot, saved_at").eq("owner_id", ownerId);
+  if (error) throw error;
+  return data || [];
+}
+export async function saveScheduleSlot(slot, snapshot, ownerId) {
+  const { error } = await supabase.from("schedule_save_slots").upsert({ slot, snapshot, owner_id: ownerId, saved_at: new Date().toISOString() }, { onConflict: "owner_id,slot" });
+  if (error) throw error;
+}
+export async function deleteScheduleSlot(slot, ownerId) {
+  const { error } = await supabase.from("schedule_save_slots").delete().eq("owner_id", ownerId).eq("slot", slot);
+  if (error) throw error;
 }
