@@ -106,6 +106,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // shift, not just relocated. Session-only (reset on regenerate); a
   // cell clears itself the moment it holds a real assignment again.
   const [kickedOutCells, setKickedOutCells] = useState(() => new Set());
+  // Set by "Scan for missing shifts" (see scanForMissingShifts) — the one
+  // best empty day per employee per pay period they're short in, as of
+  // the last time the button was clicked. A fresh click always replaces
+  // this outright rather than accumulating; null means it's never been
+  // run this session (no banner), [] means it ran and found nothing.
+  const [missingShiftCells, setMissingShiftCells] = useState(() => new Set());
+  const [missingShiftReport, setMissingShiftReport] = useState(null);
   const [employees, setEmployees] = useState([]);
   const [ptoStatus, setPtoStatus] = useState({});
   const [ptoSource, setPtoSource] = useState({}); // key -> 'manual' | 'weekend_rotation'
@@ -195,6 +202,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     setCushionShiftCodes(s.cushionShiftCodes || []);
     setManualEditWarnings([]);
     setKickedOutCells(new Set());
+    setMissingShiftCells(new Set());
+    setMissingShiftReport(null);
   };
 
   // Initial load: employees, holidays, and collapsed shifts from Supabase.
@@ -1932,6 +1941,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       setSchedule(scheduleSnapshot);
       setManualEditWarnings([]);
       setKickedOutCells(autoKickedOutCells);
+      setMissingShiftCells(new Set());
+      setMissingShiftReport(null);
       saveScheduleSnapshot(scheduleSnapshot, viewingOwnerId).catch(reportSyncError);
       setGenerating(false);
       setTab("schedule");
@@ -2082,6 +2093,83 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     applyScheduleSnapshot(saved.snapshot);
     saveScheduleSnapshot(saved.snapshot, viewingOwnerId).catch(reportSyncError);
     setTab("schedule");
+  };
+
+  // "Scan for missing shifts" — a deliberate, on-demand check for
+  // permanent staff who are under their own guaranteed shift count on
+  // the CURRENT grid, however it got that way (generate(), a drag, a
+  // relocation side-effect, several of each). Unlike the auto-rearrange
+  // banner, this never cares HOW someone fell short — it just looks at
+  // where things stand right now.
+  //
+  // Two passes: an employee's running total vs their scaled cap first
+  // (shiftTallyFor, the same numbers the Shifts column shows) just to
+  // decide who's worth a closer look; then each of THEIR pay periods
+  // gets checked against its own guarantee (PTO-1 shrinks it, exactly
+  // like applyMinimumShiftGuarantees does), since someone under overall
+  // can still have hit every period they've reached so far — the
+  // shortfall is still ahead of them, in a later period.
+  //
+  // For each period that's short, flags exactly one empty day for them —
+  // the best of however many are open that period, scored by: whether a
+  // real coverage hole they're trained for already sits there (most
+  // actionable), how many lonely shifts/lonely days-off it leaves across
+  // their whole schedule, and whether it cuts into an off-weekend worth
+  // extending. Never auto-assigns anything — purely a flag for the
+  // manager to act on by hand, same spirit as the phantom-coverage
+  // marker. A fresh click always replaces the whole flagged set outright,
+  // it never accumulates across clicks.
+  const scanForMissingShifts = () => {
+    if (!schedule) return;
+    const cells = new Set();
+    const report = [];
+    permanent.forEach((e) => {
+      if (!e.shiftCap) return;
+      const tally = shiftTallyFor(e);
+      if (tally.cap == null || tally.total >= tally.cap) return;
+      const { windowDays, maxShifts } = e.shiftCap;
+      const worked = workedDayIndicesFromSchedule(schedule.days, e.id);
+      const workedSet = new Set(worked);
+      const totalDays = schedule.days.length;
+      const numBlocks = Math.ceil(totalDays / windowDays);
+      for (let b = 0; b < numBlocks; b++) {
+        const blockStart = b * windowDays;
+        const blockEnd = Math.min(blockStart + windowDays, totalDays);
+        const target = guaranteeTargetForBlock(ptoStatus, ptoSource, e.id, blockStart, blockEnd, maxShifts);
+        const actualInBlock = worked.filter((idx) => idx >= blockStart && idx < blockEnd).length;
+        if (actualInBlock >= target) continue;
+
+        let best = null, bestScore = Infinity;
+        for (let idx = blockStart; idx < blockEnd; idx++) {
+          if (workedSet.has(idx)) continue;
+          if (ptoStatus[key(e.id, idx)]) continue;
+          const day = schedule.days[idx];
+          if (!respectsFixedDayRestriction(e, [day.dow])) continue;
+          if (consecutiveHardLimit && wouldExceedConsecutiveDays(worked, [idx], maxConsecutiveDays)) continue;
+
+          const hypotheticalWorked = [...worked, idx];
+          const hypotheticalWorkedSet = new Set(hypotheticalWorked);
+          const freeIdx = schedule.days.filter((d) => !hypotheticalWorkedSet.has(d.idx) && !ptoStatus[key(e.id, d.idx)]).map((d) => d.idx);
+          const hasMatchingHole = day.holes.some((hc) => e.allowedShifts.includes(hc));
+          const score = (hasMatchingHole ? 0 : 1)
+            + countLonelyShifts(hypotheticalWorked, totalDays)
+            + countLonelyDaysOff(hypotheticalWorked, freeIdx)
+            + (breaksOffWeekend(e, day) ? 1 : 0);
+          if (score < bestScore) { bestScore = score; best = idx; }
+        }
+
+        const periodLabel = `${schedule.days[blockStart].wd} ${schedule.days[blockStart].md} – ${schedule.days[blockEnd - 1].wd} ${schedule.days[blockEnd - 1].md}`;
+        if (best == null) {
+          report.push(`${e.name} is short ${target - actualInBlock} shift(s) for ${periodLabel}, but no safe open day was found — check training, fixed days, and the consecutive-day limit by hand.`);
+          continue;
+        }
+        cells.add(key(e.id, best));
+        const d = schedule.days[best];
+        report.push(`${e.name} is short ${target - actualInBlock} shift(s) for ${periodLabel} — suggested day: ${d.wd} ${d.md}.`);
+      }
+    });
+    setMissingShiftCells(cells);
+    setMissingShiftReport(report);
   };
 
   // Shared tail for every manual edit (swap or fill): rebuild every report
@@ -2395,6 +2483,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 const isShift = ALL_SHIFT_CODES.includes(code);
                 const displayText = code === "OFF" ? "" : isShift ? shiftLabel(code) : code;
                 const kickedOut = code === "OFF" && kickedOutCells.has(key(emp.id, d.idx));
+                const missingFlag = code === "OFF" && !kickedOut && missingShiftCells.has(key(emp.id, d.idx));
                 const bg = isShift ? getShiftColor(code) : (code === "PTO-1" || code === "WKND") ? "#DC2626" : code === "PTO-2" ? "#F59E0B" : code === "OFF" ? "#E4E7EC" : "transparent";
                 const fg = isShift || code === "PTO-1" || code === "WKND" || code === "PTO-2" ? "#fff" : "#64748B";
                 const draggable = canDragCell(code);
@@ -2405,10 +2494,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       className={phantom ? "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold animate-pulse" : "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"}
                       style={{
                         background: bg, color: fg, fontSize: gridCellFontSize(displayText),
-                        border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : pinned ? "3px solid #2563EB" : forcedHoliday ? "3px dashed #2563EB" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : kickedOut ? "2px dashed #F59E0B" : "none",
+                        border: phantom ? "3px dashed #DC2626" : override ? "2px dashed #F59E0B" : pinned ? "3px solid #2563EB" : forcedHoliday ? "3px dashed #2563EB" : code === "WKND" ? "3px dashed #7C3AED" : (code === "PTO-1" || code === "PTO-2") ? "3px solid #000" : isContinuityCode(code) ? "2px solid #1A2233" : kickedOut ? "2px dashed #F59E0B" : missingFlag ? "2px dotted #F59E0B" : "none",
                         cursor: draggable ? "grab" : droppable ? "copy" : "default",
                       }}
-                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : pinned ? "Manually pinned — you chose this exact shift for this day, and the rest of the schedule was built around it." : forcedHoliday ? "Forced holiday work — scheduled here to cover sparse holiday staffing even though it's normally their day off." : kickedOut ? `${emp.name} had a real shift here before it was handed to someone else — a drag, or the generator's own rearrangement — with nothing given back. They may now be short; assign them something else if they still need to hit their target.` : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
+                      title={phantom ? `Needs manual coverage — ${emp.name} is short their guaranteed shift count this pay period, but every safe day would break the ${maxConsecutiveDays}-day consecutive-day limit (often because a weekend-paired or continuity day sits right at the pay-period boundary). Counted toward their total; assign it by hand or relax the limit.` : pinned ? "Manually pinned — you chose this exact shift for this day, and the rest of the schedule was built around it." : forcedHoliday ? "Forced holiday work — scheduled here to cover sparse holiday staffing even though it's normally their day off." : kickedOut ? `${emp.name} had a real shift here before it was handed to someone else — a drag, or the generator's own rearrangement — with nothing given back. They may now be short; assign them something else if they still need to hit their target.` : missingFlag ? `"Scan for missing shifts" suggests this day for ${emp.name} — they're short their pay-period minimum, and this looked like the safest open day to cover it.` : code === "WKND" ? "Off per weekend rotation — not approved leave" : manual ? "Manually moved" : isShift && displayText !== code ? code : undefined}
                       draggable={draggable}
                       onDragStart={draggable ? (e) => { e.dataTransfer.setData("application/json", JSON.stringify({ empId: emp.id, dayIdx: d.idx })); e.dataTransfer.effectAllowed = "move"; } : undefined}
                       onDragOver={droppable ? (e) => e.preventDefault() : undefined}
@@ -2428,6 +2517,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       {forcedHoliday && !phantom && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#2563EB] border border-white text-white text-[7px] leading-3 font-bold">H</span>}
                       {pinned && !phantom && !forcedHoliday && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#2563EB] border border-white text-white text-[7px] leading-3 font-bold">P</span>}
                       {kickedOut && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#F59E0B] border border-white text-white text-[8px] leading-3 font-bold">−</span>}
+                      {missingFlag && <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-[#F59E0B] border border-white text-white text-[8px] leading-3 font-bold">+</span>}
                     </div>
                   </td>
                 );
@@ -2651,6 +2741,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
                   <li><b>Export CSV</b> turns it into a spreadsheet, including any manual swaps or gap-fills you've made. <b>Regenerate</b> reruns the optimizer from scratch if you want another pass — this discards any manual edits.</li>
                   <li><b>Save to Slot 1 / Slot 2</b> — keeps a copy of exactly what's on screen right now (including manual edits) in one of two slots, safe from the next Regenerate or edit. Click a saved slot to load it back as the active schedule — unsaved changes on screen are lost, same as Regenerate. Saving over an already-used slot asks you to confirm first.</li>
+                  <li><b>Scan for missing shifts</b> — a separate, on-demand check: scans every permanent employee's CURRENT grid (after any manual edits, whatever caused them) for anyone under their own pay-period minimum, PTO-1 counted toward it the same way the generator counts it, and flags the single best open day per shortfall with a dotted amber "+" cell — preferring a day that already has a real coverage gap they're trained for, and otherwise the one that creates the fewest lonely shifts or lonely days off and avoids cutting into an off-weekend. It only flags; it never assigns anything for you. Click it again any time — each click replaces the flagged cells with a fresh scan of what's on screen right now.</li>
                 </ul>
                 <img src="/instructions/schedule-grid.png" alt="Schedule grid with fairness score, a warning about unfillable shifts, the legend, and export/regenerate buttons" className="w-full rounded border border-[#E4E7EC] mb-2" />
                 <img src="/instructions/weekend-pairing.png" alt="Schedule grid showing Saturday and Sunday columns with the same employee on the same shift code both days" className="w-full rounded border border-[#E4E7EC] mb-2" />
@@ -3488,6 +3579,16 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 <button onClick={() => setManualEditWarnings([])} className="text-xs underline whitespace-nowrap">Dismiss</button>
               </div>
             )}
+            {missingShiftReport != null && (
+              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2 flex items-start justify-between gap-3">
+                {missingShiftReport.length > 0 ? (
+                  <span>🔍 {missingShiftReport.length} pay-period shortfall(s) found — look for the dotted amber "+" cells below: {missingShiftReport.join(" ")}</span>
+                ) : (
+                  <span>🔍 Scan complete — no permanent staff are short their pay-period minimum right now.</span>
+                )}
+                <button onClick={() => setMissingShiftReport(null)} className="text-xs underline whitespace-nowrap">Dismiss</button>
+              </div>
+            )}
             <div className="bg-[#EFF6FF] border border-[#BFDBFE] text-[#1E3A8A] text-xs rounded px-3 py-2">
               ✋ Drag any shift cell onto another to swap them by hand — a small teal dot marks a cell you've moved. Dropping onto an empty cell moves the shift instead of swapping it; an amber dashed cell with a "−" marks wherever that leaves someone short. Fairness Report, Optimization, and Export CSV all update to match. Locked-leave days and continuity shifts can't be dragged onto or moved.
             </div>
@@ -3557,7 +3658,15 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ border: "3px dashed #2563EB" }} />forced holiday work</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ border: "3px solid #2563EB" }} />manually pinned shift</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" style={{ border: "2px dashed #F59E0B" }} />lost a shift with nothing given back (now likely short)</div>
+              <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" style={{ border: "2px dotted #F59E0B" }} />"Scan for missing shifts" suggests this day</div>
               <div className="ml-auto flex items-center gap-2">
+                <button
+                  onClick={scanForMissingShifts}
+                  title="Checks every permanent employee against their own pay-period minimum (PTO-1 counted toward it) on the CURRENT grid, and flags the best open day to cover any shortfall it finds."
+                  className="px-3 py-1.5 text-xs font-semibold rounded border border-[#CA8A04] text-[#CA8A04] hover:bg-[#CA8A04] hover:text-white"
+                >
+                  🔍 Scan for missing shifts
+                </button>
                 {[1, 2].map((slot) => (
                   <div key={slot} className="flex items-center gap-1">
                     {scheduleSlots[slot] ? (
