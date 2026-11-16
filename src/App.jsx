@@ -2413,12 +2413,24 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       .sort((a, b) => (b.trained - a.trained) || a.name.localeCompare(b.name));
   };
 
-  // A strong left border at the start of every pay period (every 14
-  // days, anchored to the schedule's own start like the cap/guarantee
-  // logic elsewhere) — purely visual, so a manager can see at a glance
-  // where one biweekly period ends and the next begins. Never on day 0
-  // itself; that edge is already the table's own left edge.
-  const payPeriodBorder = (idx) => (idx !== 0 && idx % 14 === 0 ? { borderLeft: "3px solid #1A2233" } : undefined);
+  // Pay periods are fixed 14-day blocks anchored to the schedule's own
+  // start, same window the cap/guarantee logic elsewhere uses. True for
+  // the last day of every full block, and also for the schedule's very
+  // last day when the final block is a short partial one — so a tally
+  // column always gets inserted right after this day, never leaving a
+  // (possibly partial) trailing period without its own total.
+  const periodWindowDays = 14;
+  const isPeriodEnd = (idx) => (idx + 1) % periodWindowDays === 0 || idx === schedule.days.length - 1;
+  // Shifts actually worked (never PTO or a day off — those never create
+  // an assignment entry in the first place, see workedDayIndicesFromSchedule)
+  // within the pay period that ends on `idx`. `idx` can be a short final
+  // block's last day, which Math.floor naturally resolves to that same
+  // partial block's own start, not the previous full one.
+  const periodTallyFor = (empId, idx) => {
+    const blockStart = Math.floor(idx / periodWindowDays) * periodWindowDays;
+    return workedDayIndicesFromSchedule(schedule.days, empId).filter((i) => i >= blockStart && i <= idx).length;
+  };
+  const periodTallyBorder = { borderLeft: "3px solid #1A2233" };
   const renderScheduleTable = (list, title) => {
     // A second header row labeling each Saturday/Sunday pair "Weekend
     // N" (1-based, numbered straight through the whole schedule, same
@@ -2428,16 +2440,21 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const weekendHeaderCells = [];
     for (let i = 0; i < schedule.days.length; i++) {
       const d = schedule.days[i];
+      let lastIdx = d.idx;
       if (d.dow === 6 && schedule.days[i + 1]?.dow === 0) {
         const wIdx = weekendIndexFor(d.date, weekendEpoch);
         weekendHeaderCells.push(
-          <th key={d.idx} colSpan={2} className="px-1 py-1 text-center text-[10px] font-semibold text-[#64748B] bg-[#F1F5F9] border-b border-[#E4E7EC]" style={payPeriodBorder(d.idx)}>
+          <th key={d.idx} colSpan={2} className="px-1 py-1 text-center text-[10px] font-semibold text-[#64748B] bg-[#F1F5F9] border-b border-[#E4E7EC]">
             Weekend {wIdx + 1}
           </th>
         );
         i++; // the Sunday is already covered by the colSpan above
+        lastIdx = schedule.days[i].idx;
       } else {
-        weekendHeaderCells.push(<th key={d.idx} className="border-b border-[#E4E7EC]" style={payPeriodBorder(d.idx)} />);
+        weekendHeaderCells.push(<th key={d.idx} className="border-b border-[#E4E7EC]" />);
+      }
+      if (isPeriodEnd(lastIdx)) {
+        weekendHeaderCells.push(<th key={`pp-${lastIdx}`} className="border-b border-[#E4E7EC] bg-[#F1F5F9]" style={periodTallyBorder} />);
       }
     }
     return (
@@ -2453,12 +2470,20 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
           <tr>
             <th className="sticky left-0 bg-white z-10 text-center px-1 py-2 border-b border-[#E4E7EC] min-w-[56px]" title="Running total for the whole schedule over their extended-hour cap, scaled up to the full schedule length. Approved PTO-1 counts toward the guarantee itself, so a pay period with time off needs fewer real shifts, not the same number crammed into what's left. Moves up or down immediately with every drag or gap fill, so swapping two people always moves both numbers at once. Turns red if any single pay period actually goes over the cap — hover for the exact numbers.">Shifts</th>
             <th className="sticky left-[56px] bg-white z-10 text-left px-3 py-2 border-b border-[#E4E7EC] min-w-[150px]">Employee</th>
-            {schedule.days.map((d) => (
-              <th key={d.idx} className={`px-1 py-2 border-b border-[#E4E7EC] font-normal text-center min-w-[36px] ${d.isWknd ? "bg-[#F1F5F9]" : ""}`} style={payPeriodBorder(d.idx)}>
-                <div className="text-[#64748B]">{d.wd[0]}</div><div className="text-[10px]">{d.md}</div>
-                {holidays.has(d.iso) && <div className="text-[9px] text-[#DC2626]">HOL</div>}
-              </th>
-            ))}
+            {schedule.days.flatMap((d) => {
+              const dayHeader = (
+                <th key={d.idx} className={`px-1 py-2 border-b border-[#E4E7EC] font-normal text-center min-w-[36px] ${d.isWknd ? "bg-[#F1F5F9]" : ""}`}>
+                  <div className="text-[#64748B]">{d.wd[0]}</div><div className="text-[10px]">{d.md}</div>
+                  {holidays.has(d.iso) && <div className="text-[9px] text-[#DC2626]">HOL</div>}
+                </th>
+              );
+              if (!isPeriodEnd(d.idx)) return [dayHeader];
+              return [dayHeader, (
+                <th key={`pp-${d.idx}`} className="px-1 py-2 border-b border-[#E4E7EC] font-normal text-center min-w-[28px] bg-[#F1F5F9]" style={periodTallyBorder} title="Pay period total — shifts actually worked this period, not counting PTO or days off. Updates live as you drag or fill gaps.">
+                  Σ
+                </th>
+              )];
+            })}
           </tr>
         </thead>
         <tbody>
@@ -2478,7 +2503,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <td className="sticky left-[56px] bg-white z-10 px-3 py-1 border-b border-[#F1F5F9] font-medium">
                 {emp.name}{emp.type === "extra" && <span className="ml-1 text-[9px] text-[#64748B]">PRN</span>}
               </td>
-              {schedule.days.map((d) => {
+              {schedule.days.flatMap((d) => {
                 const { code, override, manual, phantom, forcedHoliday, pinned } = cellFor(emp, d);
                 const isShift = ALL_SHIFT_CODES.includes(code);
                 const displayText = code === "OFF" ? "" : isShift ? shiftLabel(code) : code;
@@ -2488,8 +2513,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 const fg = isShift || code === "PTO-1" || code === "WKND" || code === "PTO-2" ? "#fff" : "#64748B";
                 const draggable = canDragCell(code);
                 const droppable = canDropOnCell(emp, d);
-                return (
-                  <td key={d.idx} className="border-b border-[#F1F5F9] p-0.5 text-center" style={payPeriodBorder(d.idx)}>
+                const dayCell = (
+                  <td key={d.idx} className="border-b border-[#F1F5F9] p-0.5 text-center">
                     <div
                       className={phantom ? "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold animate-pulse" : "relative w-9 h-6 rounded-sm flex items-center justify-center font-mono font-semibold"}
                       style={{
@@ -2521,19 +2546,30 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                     </div>
                   </td>
                 );
+                if (!isPeriodEnd(d.idx)) return [dayCell];
+                const periodTotal = periodTallyFor(emp.id, d.idx);
+                return [dayCell, (
+                  <td key={`pp-${d.idx}`} className="border-b border-[#F1F5F9] p-0.5 text-center bg-[#F8FAFC] font-semibold text-[#1A2233]" style={periodTallyBorder} title={`${emp.name}: ${periodTotal} shift(s) actually worked this pay period — not counting PTO or days off. Live — updates with every drag or gap fill.`}>
+                    {periodTotal}
+                  </td>
+                )];
               })}
             </tr>
             );
           })}
           <tr>
             <td colSpan={2} className="sticky left-0 bg-white z-10 px-3 py-1 font-semibold text-[#DC2626]">⚠ Coverage gaps</td>
-            {schedule.days.map((d) => (
-              <td key={d.idx} className="text-center p-0.5" style={payPeriodBorder(d.idx)}>
-                {d.holes.length > 0 ? (
-                  <div className="w-9 h-6 rounded-sm flex items-center justify-center font-bold text-[9px] text-white animate-pulse" style={{ background: "#DC2626", boxShadow: "0 0 0 2px #DC2626" }} title={`Unfilled: ${d.holes.map(shiftLabel).join(", ")}`}>HOLE</div>
-                ) : null}
-              </td>
-            ))}
+            {schedule.days.flatMap((d) => {
+              const gapCell = (
+                <td key={d.idx} className="text-center p-0.5">
+                  {d.holes.length > 0 ? (
+                    <div className="w-9 h-6 rounded-sm flex items-center justify-center font-bold text-[9px] text-white animate-pulse" style={{ background: "#DC2626", boxShadow: "0 0 0 2px #DC2626" }} title={`Unfilled: ${d.holes.map(shiftLabel).join(", ")}`}>HOLE</div>
+                  ) : null}
+                </td>
+              );
+              if (!isPeriodEnd(d.idx)) return [gapCell];
+              return [gapCell, <td key={`pp-${d.idx}`} className="text-center p-0.5" style={periodTallyBorder} />];
+            })}
           </tr>
         </tbody>
       </table>
@@ -3659,6 +3695,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ border: "3px solid #2563EB" }} />manually pinned shift</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" style={{ border: "2px dashed #F59E0B" }} />lost a shift with nothing given back (now likely short)</div>
               <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block bg-[#E4E7EC]" style={{ border: "2px dotted #F59E0B" }} />"Scan for missing shifts" suggests this day</div>
+              <div className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-flex items-center justify-center text-[10px] font-semibold bg-[#F8FAFC] border border-[#1A2233]">Σ</span>shifts actually worked this pay period (no PTO/days off)</div>
               <div className="ml-auto flex items-center gap-2">
                 <button
                   onClick={scanForMissingShifts}
