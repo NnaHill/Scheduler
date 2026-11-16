@@ -113,6 +113,21 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // run this session (no banner), [] means it ran and found nothing.
   const [missingShiftCells, setMissingShiftCells] = useState(() => new Set());
   const [missingShiftReport, setMissingShiftReport] = useState(null);
+  // Local picker state for the always-available "Add overflow (E0)
+  // coverage" tool — a day chosen first, then an employee, same
+  // two-step shape as everything else, but not tied to any actual gap
+  // (E0 is never a hole) so there's no list to drive it off of.
+  const [overflowAssignDay, setOverflowAssignDay] = useState("");
+  // Dismissed structural alert boxes at the top of the Schedule tab
+  // (cap violations, unfillable shifts, etc.) — keyed by the alert's own
+  // content (type + exact text), not just a boolean per type, so a
+  // dismissal only ever hides THIS exact issue. If a regenerate or edit
+  // changes what the violation actually says (different people, a
+  // different count), the key no longer matches and it reappears on its
+  // own — no explicit "did the underlying thing change" bookkeeping
+  // needed. Still cleared outright on every generate() for a clean
+  // slate, same as kickedOutCells/missingShiftCells.
+  const [dismissedAlerts, setDismissedAlerts] = useState(() => new Set());
   const [employees, setEmployees] = useState([]);
   const [ptoStatus, setPtoStatus] = useState({});
   const [ptoSource, setPtoSource] = useState({}); // key -> 'manual' | 'weekend_rotation'
@@ -204,6 +219,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     setKickedOutCells(new Set());
     setMissingShiftCells(new Set());
     setMissingShiftReport(null);
+    setDismissedAlerts(new Set());
   };
 
   // Initial load: employees, holidays, and collapsed shifts from Supabase.
@@ -1943,6 +1959,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       setKickedOutCells(autoKickedOutCells);
       setMissingShiftCells(new Set());
       setMissingShiftReport(null);
+      setDismissedAlerts(new Set());
       saveScheduleSnapshot(scheduleSnapshot, viewingOwnerId).catch(reportSyncError);
       setGenerating(false);
       setTab("schedule");
@@ -2296,6 +2313,27 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     });
   };
 
+  // Deliberately adds a cushion body on E0, independent of whether that
+  // day has an actual coverage gap — E0 is never a hole (see gapsList),
+  // so there's nothing in the normal fill pipeline to hang this off of.
+  // Always picks a fresh numbered key (nextOverflowKey) rather than the
+  // bare "E0" literal, so it never collides with — or overwrites —
+  // anyone already padded up on E0 that same day.
+  const applyOverflowFill = (targetEmp, dayIdx) => {
+    setSchedule((prev) => {
+      if (!prev) return prev;
+      const workingDays = [...prev.days];
+      const day = { ...workingDays[dayIdx], assignment: { ...workingDays[dayIdx].assignment } };
+      const code = nextOverflowKey(day.assignment);
+      day.assignment[code] = { empId: targetEmp.id, type: targetEmp.type, override: false, fixed: false, manual: true };
+      day.holes = holesOnDay(day);
+      workingDays[dayIdx] = day;
+
+      setManualEditWarnings(manualEditWarning(workingDays, targetEmp, dayIdx, code));
+      return recomputeAndPersistSchedule(prev, workingDays);
+    });
+  };
+
   const summary = useMemo(() => {
     if (!schedule) return null;
     const standardFairness = schedule.fairness.filter((f) => !f.shiftCap);
@@ -2411,6 +2449,18 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     return [...permCandidates, ...prnCandidates]
       .map((e) => ({ ...e, trained: e.allowedShifts.includes(code) }))
       .sort((a, b) => (b.trained - a.trained) || a.name.localeCompare(b.name));
+  };
+
+  // Candidates for the overflow-coverage tool: permanent staff only (by
+  // design — this is a deliberate cushion-body tool, not the general
+  // gap-fill one above, which already covers PRNs), same hard rules as
+  // everywhere else (not already working that day, not on approved
+  // PTO-1). No "trained" label — E0 is a placeholder body, not a shift
+  // anyone is actually trained on, so that distinction doesn't apply.
+  const overflowCandidatesFor = (dayIdx) => {
+    const day = schedule.days[dayIdx];
+    const alreadyWorking = new Set(Object.values(day.assignment).map((a) => a.empId));
+    return permanent.filter((e) => !alreadyWorking.has(e.id) && ptoStatus[key(e.id, dayIdx)] !== "PTO1").sort((a, b) => a.name.localeCompare(b.name));
   };
 
   // Pay periods are fixed 14-day blocks anchored to the schedule's own
@@ -2576,6 +2626,41 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     </div>
     );
   };
+
+  // One shared shape for every alert box at the top of the Schedule tab:
+  // tone picks the color (critical = red, a real rule violation you may
+  // need to act on; advisory = amber, worth knowing but not blocking;
+  // success = green, an all-clear). `dismissKey`, when given, both adds
+  // the Dismiss button and keys the dismissal to this alert's own exact
+  // content — see dismissedAlerts above for why that's content, not a
+  // boolean per type. Banners with their own existing dismiss wiring
+  // (manualEditWarnings, missingShiftReport) don't need a dismissKey —
+  // they already clear themselves the same way, just via their own
+  // dedicated state instead of the shared Set.
+  const dismissAlert = (keyStr) => setDismissedAlerts((prev) => new Set(prev).add(keyStr));
+  const ALERT_TONE_CLASSES = {
+    critical: "bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] font-semibold",
+    advisory: "bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E]",
+    success: "bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46]",
+  };
+  const AlertBox = ({ tone, dismissKey, onDismiss, children }) => {
+    if (dismissKey && dismissedAlerts.has(dismissKey)) return null;
+    return (
+      <div className={`${ALERT_TONE_CLASSES[tone]} text-sm rounded px-3 py-2 flex items-start justify-between gap-3`}>
+        <div className="flex-1">{children}</div>
+        {(dismissKey || onDismiss) && (
+          <button onClick={() => (onDismiss ? onDismiss() : dismissAlert(dismissKey))} className="text-xs underline whitespace-nowrap">Dismiss</button>
+        )}
+      </div>
+    );
+  };
+  // Turns a joined-sentence violation list into a scannable bulleted
+  // list instead — one line per violation, no semicolon-chain to parse.
+  const AlertList = ({ items }) => (
+    <ul className="list-disc list-inside mt-1 space-y-0.5">
+      {items.map((item, i) => <li key={i}>{item}</li>)}
+    </ul>
+  );
 
   if (!loaded) {
     return (
@@ -2775,6 +2860,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li>The same "−" badge (and an amber banner right after generating) also fires when <b>Generate/Regenerate itself</b> hands someone's shift to someone else with nothing given back — the optimizer does this internally while balancing fairness, same as a drag would, just without you clicking anything. Both causes look and read the same way, since the fix is the same either way: reassign them something else if they still need it.</li>
                   <li>Dragging someone <i>away</i> from a day they were covering, onto a day where the other person wasn't working, leaves their original day empty — that's not a bug. Nobody automatically backfills it, so it shows up honestly as a new Coverage gap instead of silently vanishing.</li>
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
+                  <li><b>"Add overflow (E0) coverage"</b> — always visible, right below the gap card, since E0 is never a HOLE and so never shows up there. Pick any day, then any permanent employee free that day, to pad them onto E0 as an extra cushion body — before a shortfall shows up, not after. Stacks alongside anyone already on E0 that day rather than replacing them.</li>
                   <li><b>Export CSV</b> turns it into a spreadsheet, including any manual swaps or gap-fills you've made. <b>Regenerate</b> reruns the optimizer from scratch if you want another pass — this discards any manual edits.</li>
                   <li><b>Save to Slot 1 / Slot 2</b> — keeps a copy of exactly what's on screen right now (including manual edits) in one of two slots, safe from the next Regenerate or edit. Click a saved slot to load it back as the active schedule — unsaved changes on screen are lost, same as Regenerate. Saving over an already-used slot asks you to confirm first.</li>
                   <li><b>Scan for missing shifts</b> — a separate, on-demand check: scans every permanent employee's CURRENT grid (after any manual edits, whatever caused them) for anyone under their own pay-period minimum, PTO-1 counted toward it the same way the generator counts it, and flags the single best open day per shortfall with a dotted amber "+" cell — preferring a day that already has a real coverage gap they're trained for, and otherwise the one that creates the fewest lonely shifts or lonely days off and avoids cutting into an off-weekend. It only flags; it never assigns anything for you. Click it again any time — each click replaces the flagged cells with a fresh scan of what's on screen right now.</li>
@@ -3550,80 +3636,90 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <span>({schedule.costBefore > 0 ? Math.round((1 - schedule.costAfter / schedule.costBefore) * 100) : 0}% improvement)</span>
             </div>
             {schedule.totalHoles > 0 && (
-              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
+              <AlertBox tone="critical" dismissKey={`holes:${schedule.totalHoles}`}>
                 ⚠ {schedule.totalHoles} shift(s) are mathematically unfillable given current staff, PTO, and qualifications — see red "HOLE" cells below.
-              </div>
+              </AlertBox>
             )}
             {schedule.totalOverrides > 0 && (
-              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
+              <AlertBox tone="advisory" dismissKey={`overrides:${schedule.totalOverrides}`}>
                 ℹ {schedule.totalOverrides} shift(s) had to pull someone off their requested PTO-2 day (marked with *).
-              </div>
+              </AlertBox>
             )}
             {schedule.continuityCheck.violations.length > 0 && (
-              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
-                ⚠ Continuity rule violations detected: {schedule.continuityCheck.violations.join("; ")}
-              </div>
+              <AlertBox tone="critical" dismissKey={`continuity:${schedule.continuityCheck.violations.join("|")}`}>
+                ⚠ Continuity rule violations detected:
+                <AlertList items={schedule.continuityCheck.violations} />
+              </AlertBox>
             )}
             {schedule.shiftCapViolations.length > 0 && (
-              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
-                ⚠ Shift-cap violations detected: {schedule.shiftCapViolations.join("; ")}
-              </div>
+              <AlertBox tone="critical" dismissKey={`capViol:${schedule.shiftCapViolations.join("|")}`}>
+                ⚠ Shift-cap violations detected:
+                <AlertList items={schedule.shiftCapViolations} />
+              </AlertBox>
             )}
             {schedule.cappedFixedDayViolations.length > 0 && (
-              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
-                ⚠ Fixed-day violations detected: {schedule.cappedFixedDayViolations.join("; ")}
-              </div>
+              <AlertBox tone="critical" dismissKey={`fixedDay:${schedule.cappedFixedDayViolations.join("|")}`}>
+                ⚠ Fixed-day violations detected:
+                <AlertList items={schedule.cappedFixedDayViolations} />
+              </AlertBox>
             )}
             {schedule.employeesMissingShifts > 0 && (
-              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
+              <AlertBox tone="advisory" dismissKey={`missingTypes:${schedule.employeesMissingShifts}`}>
                 ℹ {schedule.employeesMissingShifts} employee(s) didn't get at least one of every active shift type this rotation — see Fairness Report for details.
-              </div>
+              </AlertBox>
             )}
             {schedule.guaranteeGaps > 0 && (
-              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
+              <AlertBox tone="critical" dismissKey={`guaranteeGaps:${schedule.guaranteeGaps}`}>
                 ⚠ {schedule.guaranteeGaps} pay period(s) are short of the guaranteed shift count — every safe day would break the consecutive-day limit, usually because a weekend-paired or continuity day sits right at the pay-period boundary. Flagged on the grid with a red "!" — assign by hand or relax the consecutive-day limit.
-              </div>
+              </AlertBox>
             )}
             {schedule.weekendPairingMismatches.length > 0 && (
-              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
-                ℹ {schedule.weekendPairingMismatches.length} weekend(s) couldn't be paired to the same person — nobody permanent was free both days, so it fell back to covering each day separately: {schedule.weekendPairingMismatches.join("; ")}
-              </div>
+              <AlertBox tone="advisory" dismissKey={`weekendPairing:${schedule.weekendPairingMismatches.join("|")}`}>
+                ℹ {schedule.weekendPairingMismatches.length} weekend(s) couldn't be paired to the same person — nobody permanent was free both days, so it fell back to covering each day separately:
+                <AlertList items={schedule.weekendPairingMismatches} />
+              </AlertBox>
             )}
             {schedule.forcedHolidayConflicts?.length > 0 && (
-              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
-                ⚠ {schedule.forcedHolidayConflicts.length} forced holiday-work tag(s) couldn't be honored: {schedule.forcedHolidayConflicts.join(" ")}
-              </div>
+              <AlertBox tone="critical" dismissKey={`forcedHoliday:${schedule.forcedHolidayConflicts.join("|")}`}>
+                ⚠ {schedule.forcedHolidayConflicts.length} forced holiday-work tag(s) couldn't be honored:
+                <AlertList items={schedule.forcedHolidayConflicts} />
+              </AlertBox>
             )}
             {schedule.pinnedShiftConflicts?.length > 0 && (
-              <div className="bg-[#FEE2E2] border-2 border-[#DC2626] text-[#991B1B] text-sm rounded px-3 py-2 font-semibold">
-                ⚠ {schedule.pinnedShiftConflicts.length} pinned shift(s) couldn't be honored: {schedule.pinnedShiftConflicts.join(" ")}
-              </div>
+              <AlertBox tone="critical" dismissKey={`pinnedConflict:${schedule.pinnedShiftConflicts.join("|")}`}>
+                ⚠ {schedule.pinnedShiftConflicts.length} pinned shift(s) couldn't be honored:
+                <AlertList items={schedule.pinnedShiftConflicts} />
+              </AlertBox>
             )}
             {schedule.pinnedShiftWarnings?.length > 0 && (
-              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
-                ℹ {schedule.pinnedShiftWarnings.length} pinned shift(s) scheduled for someone not trained on that code: {schedule.pinnedShiftWarnings.join(" ")}
-              </div>
+              <AlertBox tone="advisory" dismissKey={`pinnedWarn:${schedule.pinnedShiftWarnings.join("|")}`}>
+                ℹ {schedule.pinnedShiftWarnings.length} pinned shift(s) scheduled for someone not trained on that code:
+                <AlertList items={schedule.pinnedShiftWarnings} />
+              </AlertBox>
             )}
             {schedule.autoRearrangedLosses?.length > 0 && (
-              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2">
-                ⚠ {schedule.autoRearrangedLosses.length} shift(s) were handed to someone else during generation, leaving the original person short — look for the dashed amber "−" cells below: {schedule.autoRearrangedLosses.join(" ")}
-              </div>
+              <AlertBox tone="advisory" dismissKey={`autoRearranged:${schedule.autoRearrangedLosses.join("|")}`}>
+                ℹ {schedule.autoRearrangedLosses.length} shift(s) were handed to someone else during generation, leaving the original person short — look for the dashed amber "−" cells below:
+                <AlertList items={schedule.autoRearrangedLosses} />
+              </AlertBox>
             )}
             {manualEditWarnings.length > 0 && (
-              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2 flex items-start justify-between gap-3">
-                <span>⚠ After your last move: {manualEditWarnings.join(" ")}</span>
-                <button onClick={() => setManualEditWarnings([])} className="text-xs underline whitespace-nowrap">Dismiss</button>
-              </div>
+              <AlertBox tone="advisory" onDismiss={() => setManualEditWarnings([])}>
+                ℹ After your last move:
+                <AlertList items={manualEditWarnings} />
+              </AlertBox>
             )}
             {missingShiftReport != null && (
-              <div className="bg-[#FEF3C7] border border-[#FDE68A] text-[#92400E] text-sm rounded px-3 py-2 flex items-start justify-between gap-3">
-                {missingShiftReport.length > 0 ? (
-                  <span>🔍 {missingShiftReport.length} pay-period shortfall(s) found — look for the dotted amber "+" cells below: {missingShiftReport.join(" ")}</span>
-                ) : (
-                  <span>🔍 Scan complete — no permanent staff are short their pay-period minimum right now.</span>
-                )}
-                <button onClick={() => setMissingShiftReport(null)} className="text-xs underline whitespace-nowrap">Dismiss</button>
-              </div>
+              missingShiftReport.length > 0 ? (
+                <AlertBox tone="advisory" onDismiss={() => setMissingShiftReport(null)}>
+                  🔍 {missingShiftReport.length} pay-period shortfall(s) found — look for the dotted amber "+" cells below:
+                  <AlertList items={missingShiftReport} />
+                </AlertBox>
+              ) : (
+                <AlertBox tone="success" onDismiss={() => setMissingShiftReport(null)}>
+                  ✓ Scan complete — no permanent staff are short their pay-period minimum right now.
+                </AlertBox>
+              )
             )}
             <div className="bg-[#EFF6FF] border border-[#BFDBFE] text-[#1E3A8A] text-xs rounded px-3 py-2">
               ✋ Drag any shift cell onto another to swap them by hand — a small teal dot marks a cell you've moved. Dropping onto an empty cell moves the shift instead of swapping it; an amber dashed cell with a "−" marks wherever that leaves someone short. Fairness Report, Optimization, and Export CSV all update to match. Locked-leave days and continuity shifts can't be dragged onto or moved.
@@ -3684,6 +3780,38 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 )}
               </div>
             )}
+            <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
+              <div className="text-sm font-semibold mb-1">Add overflow (E0) coverage</div>
+              <p className="text-xs text-[#64748B] mb-3">Always here, independent of any actual coverage gap — E0 is never a hole, so it's not covered by "Fill a coverage gap" above. Pad any day with a permanent employee's extra body as a cushion against a shortfall, before one even shows up. Never overwrites anyone already on E0 that day; it just adds alongside them.</p>
+              <div className="flex items-center gap-2 flex-wrap text-xs">
+                <select
+                  value={overflowAssignDay}
+                  onChange={(e) => setOverflowAssignDay(e.target.value)}
+                  className="border border-[#E4E7EC] rounded px-2 py-1 text-xs"
+                >
+                  <option value="">Day…</option>
+                  {schedule.days.map((d) => (
+                    <option key={d.idx} value={d.idx}>{d.wd} {d.md}</option>
+                  ))}
+                </select>
+                <select
+                  key={overflowAssignDay}
+                  defaultValue=""
+                  disabled={overflowAssignDay === ""}
+                  onChange={(e) => {
+                    if (!e.target.value || overflowAssignDay === "") return;
+                    const chosen = permanent.find((x) => String(x.id) === e.target.value);
+                    if (chosen) { applyOverflowFill(chosen, Number(overflowAssignDay)); setOverflowAssignDay(""); }
+                  }}
+                  className="border border-[#E4E7EC] rounded px-2 py-1 text-xs disabled:bg-[#F8FAFC] disabled:text-[#94A3B8]"
+                >
+                  <option value="">{overflowAssignDay === "" ? "Pick a day first…" : "Assign to…"}</option>
+                  {overflowAssignDay !== "" && overflowCandidatesFor(Number(overflowAssignDay)).map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
             <div className="flex items-center gap-3 flex-wrap text-xs">
               <div className="text-[#64748B]">Legend:</div>
               {ALL_SHIFT_CODES.map((s) => <div key={s} className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{ background: getShiftColor(s) }} />{shiftLabel(s)}{isContinuityCode(s) ? "†" : ""}</div>)}
