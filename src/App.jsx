@@ -148,6 +148,17 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [scheduleSlots, setScheduleSlots] = useState({ 1: null, 2: null });
   const [tab, setTab] = useState("instructions");
   const [generating, setGenerating] = useState(false);
+  const [generatingRotation, setGeneratingRotation] = useState(false);
+  // Session-only undo history — a schedule snapshot pushed right before
+  // ANY action that replaces or edits it (both Regenerate buttons, every
+  // manual drag/fill, loading a save slot), capped at the last 10 so it
+  // never grows unbounded over a long session. Not persisted to the
+  // database — same as kickedOutCells/missingShiftCells/dismissedAlerts,
+  // it's a this-session safety net, not a permanent audit trail, and it
+  // resets whenever a schedule is freshly loaded (see the initial-load
+  // effect) since a different load means a different history entirely.
+  const [undoStack, setUndoStack] = useState([]);
+  const UNDO_LIMIT = 10;
   const [loaded, setLoaded] = useState(false);
   const [syncError, setSyncError] = useState(null);
   const [leaveStart, setLeaveStart] = useState("");
@@ -265,6 +276,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         // schedule yet) must never block the rest of the app from loading.
         const savedSchedule = await fetchScheduleSnapshot(viewingOwnerId).catch((err) => { reportSyncError(err); return null; });
         if (cancelled) return;
+        setUndoStack([]);
         if (savedSchedule) applyScheduleSnapshot(savedSchedule);
         // Save slots are their own best-effort fetch, same reasoning as
         // the rest of this block — a missing table (migration not yet
@@ -1735,6 +1747,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   };
 
   const generate = () => {
+    if (schedule) setUndoStack((s) => [...s.slice(-(UNDO_LIMIT - 1)), schedule]);
     setGenerating(true);
     setTimeout(() => {
       const stats = {};
@@ -1966,6 +1979,142 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     }, 30);
   };
 
+  // "Regenerate-N" — a deliberately simple alternative to generate():
+  // instead of the fairness-score day-walk + 2,500-pass local search,
+  // every weekday (Mon-Fri, holidays excluded) gets rebuilt from a
+  // plain rotation — person 1 gets shift 1 Monday, shift 2 Tuesday...
+  // person 2 gets shift 2 Monday, shift 3 Tuesday... wrapping forever,
+  // in the exact order shifts are listed under Manage Shifts. Weekends
+  // and holidays are never touched at all — whatever's there (from the
+  // last real Regenerate) stays exactly as-is. Pinned shifts, continuity
+  // blocks, and anyone's approved PTO-1 are the non-negotiables: if a
+  // weekday cell already holds one of those, it's left alone and that
+  // employee is skipped for the day entirely (not double-booked).
+  //
+  // There are usually more permanent employees than real shift codes
+  // (e.g. 15 people, 9 shifts), so not everyone can work every weekday.
+  // Who's "active" that day slides by one position every workday too —
+  // over a full cycle, everyone gets an equal share of working days and
+  // resting (OFF) days, instead of the same few people always being the
+  // leftover.
+  //
+  // No local search or guarantee top-up runs afterward — the point is
+  // to see the plain rotation, not have it immediately re-optimized away.
+  const regenerateByRotation = () => {
+    if (!schedule) return;
+    setUndoStack((s) => [...s.slice(-(UNDO_LIMIT - 1)), schedule]);
+    setGeneratingRotation(true);
+    setTimeout(() => {
+      const workingDays = schedule.days.map((d) => ({ ...d, assignment: { ...d.assignment } }));
+      const rotationCodes = weekdayShifts.filter((s) => !isContinuityCode(s));
+      const N = rotationCodes.length;
+      const M = permanent.length;
+
+      if (N > 0 && M > 0) {
+        // Clear every non-locked weekday rotation slot FIRST, across the
+        // whole schedule, before filling anything in. Without this, a
+        // day being filled early in the walk would still see its LATER,
+        // not-yet-reprocessed weekdays holding their old leftover
+        // assignments — artificially inflating "how much has this
+        // person already worked" for the cap/consecutive-day checks
+        // below, since those stale future days haven't actually been
+        // decided yet. Pinned shifts, continuity blocks, and anyone's
+        // approved PTO-1 stay — a plain PTO-2 override isn't one of the
+        // non-negotiables, so it's cleared and rebuilt like any other
+        // slot.
+        const isLocked = (info) => info.fixed || info.pinned;
+        workingDays.forEach((day) => {
+          if (day.dow === 0 || day.dow === 6 || holidays.has(day.iso)) return;
+          rotationCodes.forEach((code) => {
+            const info = day.assignment[code];
+            if (info && !isLocked(info)) delete day.assignment[code];
+          });
+          day.holes = holesOnDay(day);
+        });
+
+        let workdayCounter = 0;
+        workingDays.forEach((day) => {
+          const isWeekend = day.dow === 0 || day.dow === 6;
+          if (isWeekend || holidays.has(day.iso)) return; // never touched, at all
+
+          // Non-negotiables already sitting on this day (survived the
+          // clear above): leave them alone, and don't also hand that
+          // same person a second, rotation-driven shift today.
+          const lockedEmpIds = new Set();
+          const lockedCodesToday = new Set();
+          Object.entries(day.assignment).forEach(([code, info]) => {
+            if (isLocked(info)) { lockedEmpIds.add(info.empId); lockedCodesToday.add(code); }
+          });
+
+          const windowStart = workdayCounter % M;
+          const activeCount = Math.min(N, M);
+          const idealIndexFor = (p) => (p + workdayCounter) % N;
+          const activePeople = Array.from({ length: activeCount }, (_, k) => (windowStart + k) % M)
+            .map((p) => ({ p, emp: permanent[p] }))
+            .filter(({ emp }) => !lockedEmpIds.has(emp.id))
+            .sort((a, b) => idealIndexFor(a.p) - idealIndexFor(b.p) || a.p - b.p);
+
+          const takenCodes = new Set(lockedCodesToday);
+          activePeople.forEach(({ p, emp }) => {
+            let idx = idealIndexFor(p);
+            for (let attempt = 0; attempt < N; attempt++) {
+              const code = rotationCodes[idx];
+              const ptoHere = ptoStatus[key(emp.id, day.idx)];
+              const worked = workedDayIndicesFromSchedule(workingDays, emp.id);
+              const eligible = !takenCodes.has(code)
+                && emp.allowedShifts.includes(code)
+                && ptoHere !== "PTO1"
+                && respectsFixedDayRestriction(emp, [day.dow])
+                && !wouldExceedShiftCap(emp, worked, [day.idx], capForBlock(emp))
+                && !(consecutiveHardLimit && wouldExceedConsecutiveDays(worked, [day.idx], maxConsecutiveDays));
+              if (eligible) {
+                day.assignment[code] = { empId: emp.id, type: "permanent", override: ptoHere === "PTO2", fixed: false };
+                takenCodes.add(code);
+                break;
+              }
+              idx = (idx + 1) % N;
+            }
+            // No safe, eligible code found anywhere in the rotation for
+            // them today — they're simply OFF; the slot(s) that
+            // couldn't be filled show up as ordinary coverage gaps.
+          });
+
+          day.holes = holesOnDay(day);
+          workdayCounter++;
+        });
+      }
+
+      const updated = { ...schedule, ...buildScheduleDerived(workingDays), costAfter: costOf(workingDays, workingDays.length) };
+      setSchedule(updated);
+      setManualEditWarnings([]);
+      setKickedOutCells(new Set());
+      setMissingShiftCells(new Set());
+      setMissingShiftReport(null);
+      setDismissedAlerts(new Set());
+      saveScheduleSnapshot(updated, viewingOwnerId).catch(reportSyncError);
+      setGeneratingRotation(false);
+      setTab("schedule");
+    }, 30);
+  };
+
+  // Pops the most recent snapshot off the undo history and makes it the
+  // active schedule again — same restore path loadFromSlot uses, so
+  // it's immediately persisted too (a reload shows the undone state,
+  // not what it undid). Every ephemeral highlight/alert resets, same as
+  // any other full-schedule replace.
+  const undoLastChange = () => {
+    if (undoStack.length === 0) return;
+    const previous = undoStack[undoStack.length - 1];
+    setUndoStack((s) => s.slice(0, -1));
+    setSchedule(previous);
+    setManualEditWarnings([]);
+    setKickedOutCells(new Set());
+    setMissingShiftCells(new Set());
+    setMissingShiftReport(null);
+    setDismissedAlerts(new Set());
+    saveScheduleSnapshot(previous, viewingOwnerId).catch(reportSyncError);
+  };
+
   // Manual drag-and-drop editing of an already-generated schedule. A
   // continuity-tagged shift can't be dragged or dropped onto — a
   // single-cell swap would silently break a multi-day commitment that's
@@ -2107,6 +2256,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const loadFromSlot = (slot) => {
     const saved = scheduleSlots[slot];
     if (!saved) return;
+    if (schedule) setUndoStack((s) => [...s.slice(-(UNDO_LIMIT - 1)), schedule]);
     applyScheduleSnapshot(saved.snapshot);
     saveScheduleSnapshot(saved.snapshot, viewingOwnerId).catch(reportSyncError);
     setTab("schedule");
@@ -2220,6 +2370,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const [codeA] = entryA || [null];
       const [codeB] = entryB || [null];
       if (!codeA && !codeB) return prev;
+      setUndoStack((s) => [...s.slice(-(UNDO_LIMIT - 1)), prev]);
 
       if (codeA) delete dayA.assignment[codeA];
       if (codeB) delete dayB.assignment[codeB];
@@ -2302,6 +2453,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const applyManualFill = (targetEmp, dayIdx, code) => {
     setSchedule((prev) => {
       if (!prev) return prev;
+      setUndoStack((s) => [...s.slice(-(UNDO_LIMIT - 1)), prev]);
       const workingDays = [...prev.days];
       const day = { ...workingDays[dayIdx], assignment: { ...workingDays[dayIdx].assignment } };
       day.assignment[code] = { empId: targetEmp.id, type: targetEmp.type, override: false, fixed: false, manual: true };
@@ -2322,6 +2474,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const applyOverflowFill = (targetEmp, dayIdx) => {
     setSchedule((prev) => {
       if (!prev) return prev;
+      setUndoStack((s) => [...s.slice(-(UNDO_LIMIT - 1)), prev]);
       const workingDays = [...prev.days];
       const day = { ...workingDays[dayIdx], assignment: { ...workingDays[dayIdx].assignment } };
       const code = nextOverflowKey(day.assignment);
@@ -2862,6 +3015,8 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
                   <li><b>"Add overflow (E0) coverage"</b> — always visible, right below the gap card, since E0 is never a HOLE and so never shows up there. Pick any day, then any permanent employee free that day, to pad them onto E0 as an extra cushion body — before a shortfall shows up, not after. Stacks alongside anyone already on E0 that day rather than replacing them.</li>
                   <li><b>Export CSV</b> turns it into a spreadsheet, including any manual swaps or gap-fills you've made. <b>Regenerate</b> reruns the optimizer from scratch if you want another pass — this discards any manual edits.</li>
+                  <li><b>Regenerate-N</b> — a completely different, much simpler pass: only weekdays get rebuilt, as a plain rotation through your shift list in the order they're set up under Manage Shifts (person 1 gets shift 1 Monday, shift 2 Tuesday, person 2 gets shift 2 Monday, shift 3 Tuesday, and so on, wrapping back to shift 1 once you run past the last one). Weekends, holidays, pinned shifts, continuity blocks, and anyone's approved PTO-1 are never touched — whatever's there stays exactly as it was. Training, PTO, caps, and the consecutive-day limit are still enforced; if the rotation's exact pick for someone isn't safe that day, it moves to the next open shift they can safely take instead, or they're simply OFF that day if nothing fits. With more employees than shift codes, not everyone works every weekday — who's resting rotates too, so it's an equal share for everyone over time, not always the same people left out. No fairness pass runs afterward, so the plain rotation pattern stays visible.</li>
+                  <li><b>↶ Undo</b> — steps backward through the last 10 schedule-changing actions this session: either Regenerate button, a drag, a gap fill, an overflow assign, or loading a save slot. The number in the button is how many steps are available. It's session-only — closing the tab or reloading clears it, same as the other in-progress highlights on this tab — so it's a short-term "oops" safety net, not a permanent history. Save Slots are still the way to keep something indefinitely.</li>
                   <li><b>Save to Slot 1 / Slot 2</b> — keeps a copy of exactly what's on screen right now (including manual edits) in one of two slots, safe from the next Regenerate or edit. Click a saved slot to load it back as the active schedule — unsaved changes on screen are lost, same as Regenerate. Saving over an already-used slot asks you to confirm first.</li>
                   <li><b>Scan for missing shifts</b> — a separate, on-demand check: scans every permanent employee's CURRENT grid (after any manual edits, whatever caused them) for anyone under their own pay-period minimum, PTO-1 counted toward it the same way the generator counts it, and flags the single best open day per shortfall with a dotted amber "+" cell — preferring a day that already has a real coverage gap they're trained for, and otherwise the one that creates the fewest lonely shifts or lonely days off and avoids cutting into an off-weekend. It only flags; it never assigns anything for you. Click it again any time — each click replaces the flagged cells with a fresh scan of what's on screen right now.</li>
                 </ul>
@@ -3864,6 +4019,22 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <button onClick={generate} disabled={generating} className="px-3 py-1.5 text-xs font-semibold rounded bg-[#0D9488] text-white hover:bg-[#0B6B62] disabled:opacity-50">
                 {generating ? "Working…" : "↻ Regenerate"}
               </button>
+              <button
+                onClick={regenerateByRotation}
+                disabled={generatingRotation}
+                title="Rebuilds only the weekdays as a plain rotation through your shift list (person 1 gets shift 1 Monday, shift 2 Tuesday, wrapping forever) — training, PTO, caps, and the consecutive-day limit are still enforced. Weekends, holidays, pins, continuity blocks, and approved PTO-1 are never touched. No fairness pass runs afterward."
+                className="px-3 py-1.5 text-xs font-semibold rounded border border-[#7C3AED] text-[#7C3AED] hover:bg-[#7C3AED] hover:text-white disabled:opacity-50"
+              >
+                {generatingRotation ? "Rotating…" : "Regenerate-N"}
+              </button>
+              <button
+                onClick={undoLastChange}
+                disabled={undoStack.length === 0}
+                title={undoStack.length > 0 ? `Undo the last change (${undoStack.length} step${undoStack.length === 1 ? "" : "s"} available this session) — covers Regenerate, Regenerate-N, drags, gap fills, and loading a slot.` : "Nothing to undo yet this session."}
+                className="px-3 py-1.5 text-xs font-semibold rounded border border-[#64748B] text-[#64748B] hover:bg-[#64748B] hover:text-white disabled:opacity-50"
+              >
+                ↶ Undo{undoStack.length > 0 ? ` (${undoStack.length})` : ""}
+              </button>
             </div>
             {renderScheduleTable(permanent, "Permanent staff")}
             {extra.length > 0 && renderScheduleTable(extra, "PRN / as-needed staff")}
@@ -3893,6 +4064,50 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                 <div className="text-xs text-[#64748B] mb-1">PTO-2 overrides</div>
                 <div className="text-lg font-bold text-[#CA8A04]">{schedule.totalOverrides}</div>
               </div>
+            </div>
+
+            <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
+              <div className="text-sm font-semibold mb-2">Shift distribution & longest streak</div>
+              <p className="text-xs text-[#64748B] mb-3">A quick look at how evenly shifts spread out per person, and the longest run of back-to-back days anyone worked — handy right after Regenerate-N to eyeball how even the rotation came out. <b>Total</b> is every shift they're actually down for however it got there — pinned shifts and weekend shifts count toward it too, same as a plain rotation pick. The full table below also has PTO, lonely days, and missing-shift-type detail.</p>
+              <table className="text-xs border-collapse w-full">
+                <thead>
+                  <tr className="bg-[#F7F8FA]">
+                    <th className="text-left px-3 py-2 border-b border-[#E4E7EC]">Employee</th>
+                    <th className="px-2 py-2 border-b border-[#E4E7EC]">Total</th>
+                    <th className="px-2 py-2 border-b border-[#E4E7EC]">Longest streak</th>
+                    <th className="px-3 py-2 border-b border-[#E4E7EC] text-left">Distribution</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {schedule.fairness.map((f) => {
+                    // Trained codes, plus anything untrained they still
+                    // picked up (E0 overflow padding, mainly) — so the
+                    // bars always add up to exactly the Total column,
+                    // nothing silently left out of the picture.
+                    const displayCodes = ALL_SHIFT_CODES.filter((s) => f.allowedShifts.includes(s) || f.perShift[s] > 0);
+                    const max = Math.max(...displayCodes.map((s) => f.perShift[s]), 1);
+                    return (
+                      <tr key={f.id}>
+                        <td className="px-3 py-1.5 border-b border-[#F1F5F9] font-medium">{f.name}</td>
+                        <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center font-semibold">{f.total}</td>
+                        <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">{f.longestRun} day{f.longestRun === 1 ? "" : "s"}{f.longestRunExceeded && <span title={`Worked ${f.longestRun} days in a row — over your ${maxConsecutiveDays}-day preference`} className="text-[#DC2626] ml-1">⚠</span>}</td>
+                        <td className="px-3 py-1.5 border-b border-[#F1F5F9]">
+                          <div className="flex items-end gap-1.5">
+                            {displayCodes.map((s) => (
+                              <div key={s} className="flex flex-col items-center" title={shiftLabel(s)}>
+                                <div className="flex items-end h-6">
+                                  <div style={{ background: getShiftColor(s), height: `${Math.max((f.perShift[s] / max) * 100, 12)}%`, width: "6px" }} className="rounded-sm" />
+                                </div>
+                                <div className="text-[9px] text-[#64748B] leading-tight">{f.perShift[s]}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
 
             <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
