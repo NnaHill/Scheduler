@@ -279,6 +279,24 @@ export function countLonelyShifts(workedDayIndices, totalDays) {
   const worked = new Set(workedDayIndices);
   return workedDayIndices.filter((idx) => idx > 0 && idx < totalDays - 1 && !worked.has(idx - 1) && !worked.has(idx + 1)).length;
 }
+// For each of an employee's own worked days, in chronological order
+// (index-aligned with workedDaysSorted), how many of their OTHER worked
+// turns have passed since they last worked this exact shift code — null
+// the first time they ever work a given code, since there's nothing yet
+// to compare against. A gap of N means "the N-cycle just completed, a
+// repeat here is exactly on schedule"; anything smaller is an early
+// repeat. Shared by Regenerate-N's own cooldown check (same math, just
+// asked about a day not yet decided) and the "Early repeats" fairness
+// metric (asked about the finished schedule).
+export function codeRepeatGaps(workedDaysSorted, codeForDay) {
+  const lastSeenTurn = {};
+  return workedDaysSorted.map((dayIdx, turnIdx) => {
+    const code = codeForDay(dayIdx);
+    const prevTurn = lastSeenTurn[code];
+    lastSeenTurn[code] = turnIdx;
+    return prevTurn === undefined ? null : turnIdx - prevTurn;
+  });
+}
 // Count how many times an employee works the identical shift code on two
 // consecutive calendar days — monotonous for staff, so it's discouraged.
 // Two exceptions, same as the rest of the app: a Saturday->Sunday pair

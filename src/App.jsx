@@ -28,6 +28,7 @@ import {
   fetchScheduleSnapshot,
   fetchScheduleSlots,
   saveScheduleSlot,
+  renameScheduleSlot,
   deleteScheduleSlot,
   fetchShiftDefinitions,
   insertShiftDefinitions,
@@ -38,7 +39,7 @@ import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
   wouldExceedShiftCap, maxShiftsInAnyPayPeriod, guaranteeTargetForBlock, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
   weekendIndexFor, scheduleWeekendEpoch, isOpenWeekend, isAdjacentToOffWeekend, kuhnMatch, partitionRun,
-  longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, countBackToBackSameShift, unfilledShifts,
+  longestConsecutiveRun, wouldExceedConsecutiveDays, countLonelyDaysOff, countLonelyShifts, countBackToBackSameShift, unfilledShifts, codeRepeatGaps,
   OVERFLOW_CODE, isOverflowKey, overflowBaseCode, nextOverflowKey, pickOverflowDays, pickPhantomCushionSlot, pickPhantomPermanentSwap, pickPhantomAnySteal,
   pickForcedHolidayCode,
 } from "./lib/schedulingCore";
@@ -149,6 +150,14 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [tab, setTab] = useState("instructions");
   const [generating, setGenerating] = useState(false);
   const [generatingRotation, setGeneratingRotation] = useState(false);
+  // N for Regenerate-N's code-repeat cooldown: how many of an
+  // employee's OWN other worked turns must pass before the same shift
+  // code can land on them again. null means "track the current shift
+  // roster automatically" (see rotationCodes.length below) rather than
+  // a number the manager explicitly chose — once they pick one from the
+  // dropdown, it stays pinned to that exact number even if the shift
+  // list changes later.
+  const [codeRepeatCooldown, setCodeRepeatCooldown] = useState(null);
   // Session-only undo history — a schedule snapshot pushed right before
   // ANY action that replaces or edits it (both Regenerate buttons, every
   // manual drag/fill, loading a save slot), capped at the last 10 so it
@@ -284,7 +293,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         const slotRows = await fetchScheduleSlots(viewingOwnerId).catch((err) => { reportSyncError(err); return []; });
         if (cancelled) return;
         const nextSlots = { 1: null, 2: null };
-        slotRows.forEach((row) => { nextSlots[row.slot] = { snapshot: row.snapshot, savedAt: row.saved_at }; });
+        slotRows.forEach((row) => { nextSlots[row.slot] = { snapshot: row.snapshot, savedAt: row.saved_at, name: row.name || null }; });
         setScheduleSlots(nextSlots);
       } catch (err) {
         if (!cancelled) reportSyncError(err);
@@ -406,6 +415,13 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // day's required coverage should ever see it.
   const weekdayShifts = ALL_SHIFT_CODES.filter((s) => !shiftDefByCode[s].collapsed && !shiftDefByCode[s].weekendOnly && !shiftDefByCode[s].overflow);
   const weekendShifts = ALL_SHIFT_CODES.filter((s) => (shiftDefByCode[s].activeWeekend || shiftDefByCode[s].weekendOnly) && !shiftDefByCode[s].collapsed && !shiftDefByCode[s].overflow);
+  // The weekday codes Regenerate-N actually rotates through — real
+  // shifts only, continuity blocks excluded (those are a locked
+  // non-negotiable, never something the rotation assigns itself).
+  // Shared with the "Early repeats" fairness metric below, and with the
+  // N-cooldown dropdown's own default and option list, so all three
+  // always agree on what "a full cycle" means for this account's roster.
+  const rotationCodes = weekdayShifts.filter((s) => !isContinuityCode(s));
   // Training doesn't apply to the overflow shift — anyone with an
   // extended-hour schedule is automatically eligible for it — so it's
   // left out of every "Trained on" picker to avoid a toggle that does
@@ -1514,7 +1530,15 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
       const freeIdx = finalDays.filter((d) => !workedSet.has(d.idx) && !ptoStatus[key(e.id, d.idx)]).map((d) => d.idx);
       const lonelyDaysOff = countLonelyDaysOff(st.workedDays, freeIdx);
       const lonelyShifts = countLonelyShifts(st.workedDays, finalDays.length);
-      return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, allowedShifts: e.allowedShifts, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded, lonelyDaysOff, lonelyShifts };
+      // How many times this employee got the exact same shift code
+      // again before clearing the N-turn cooldown — the "was it evenly
+      // spaced out" check, same N Regenerate-N itself aims for (see
+      // codeRepeatCooldown), computed here against whatever's actually
+      // on the grid, regardless of what produced it.
+      const repeatGaps = codeRepeatGaps(st.workedDays, (dayIdx) => st.codeByDay[dayIdx]);
+      const effectiveCooldown = codeRepeatCooldown ?? rotationCodes.length;
+      const earlyRepeats = repeatGaps.filter((g) => g !== null && g < effectiveCooldown).length;
+      return { id: e.id, name: e.name, fixedDays: e.fixedDays, shiftCap: e.shiftCap || null, allowedShifts: e.allowedShifts, total: st.totalWorked, perShift: st.shiftCount, offDays, pto1Days, pto2Honored, pto2Overridden, weekendCount: st.weekendCount, weekendRuleBroken, missingShifts, longestRun, longestRunExceeded, lonelyDaysOff, lonelyShifts, earlyRepeats };
     });
     const extraFairness = extra.map((e) => {
       const total = finalDays.reduce((sum, d) => sum + Object.values(d.assignment).filter((a) => a.empId === e.id && a.type === "extra").length, 0);
@@ -1979,112 +2003,101 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     }, 30);
   };
 
-  // "Regenerate-N" — a deliberately simple alternative to generate():
-  // instead of the fairness-score day-walk + 2,500-pass local search,
-  // every weekday (Mon-Fri, holidays excluded) gets rebuilt from a
-  // plain rotation — person 1 gets shift 1 Monday, shift 2 Tuesday...
-  // person 2 gets shift 2 Monday, shift 3 Tuesday... wrapping forever,
-  // in the exact order shifts are listed under Manage Shifts. Weekends
-  // and holidays are never touched at all — whatever's there (from the
-  // last real Regenerate) stays exactly as-is. Pinned shifts, continuity
-  // blocks, and anyone's approved PTO-1 are the non-negotiables: if a
-  // weekday cell already holds one of those, it's left alone and that
-  // employee is skipped for the day entirely (not double-booked).
+  // "Regenerate-N" — reshuffles the schedule that's already on screen
+  // to spread shift-code repeats out more evenly; it never decides WHO
+  // works WHICH DAYS. That's taken as a given from the current grid —
+  // nobody's total shift count for any pay period changes, because
+  // nobody's set of worked days changes. All it does is swap which
+  // CODE two people already working the same day are down for, when
+  // that improves spacing.
   //
-  // There are usually more permanent employees than real shift codes
-  // (e.g. 15 people, 9 shifts), so not everyone can work every weekday.
-  // Who's "active" that day slides by one position every workday too —
-  // over a full cycle, everyone gets an equal share of working days and
-  // resting (OFF) days, instead of the same few people always being the
-  // leftover.
+  // The target: nobody should get the exact same shift code again until
+  // N of their own other worked days have passed (see
+  // codeRepeatCooldown) — "cycle through a full set of codes before any
+  // repeat" by default, looser or stricter if a different N is picked
+  // from the dropdown. This runs as a randomized search (2,500 trials,
+  // same shape as the real optimizer's own local search): pick a
+  // weekday at random, pick two people already working it, and swap
+  // their codes only if doing so doesn't make the schedule's overall
+  // spacing any worse. Weekends, holidays, pinned shifts, continuity
+  // blocks, phantom (needs-manual-coverage) slots, and PRN coverage are
+  // never touched — those aren't "already-working pairs" eligible to
+  // swap, they're the non-negotiables. A swap also only ever happens
+  // between two people each trained for the OTHER's code — nothing here
+  // ever puts someone on a shift they're not qualified for.
   //
-  // No local search or guarantee top-up runs afterward — the point is
-  // to see the plain rotation, not have it immediately re-optimized away.
+  // Because nobody's worked-day set ever changes, there's no cap,
+  // PTO-1, fixed-day, or consecutive-day check needed at all — none of
+  // those can be affected by swapping which code someone already
+  // working today is down for. The only outcome this can't improve is
+  // when nobody eligible to swap with has training for the other's
+  // code; those repeats stay exactly as they were, and still show up
+  // honestly in "Fairness check" as Early repeats.
   const regenerateByRotation = () => {
     if (!schedule) return;
     setUndoStack((s) => [...s.slice(-(UNDO_LIMIT - 1)), schedule]);
     setGeneratingRotation(true);
     setTimeout(() => {
-      const workingDays = schedule.days.map((d) => ({ ...d, assignment: { ...d.assignment } }));
-      const rotationCodes = weekdayShifts.filter((s) => !isContinuityCode(s));
-      const N = rotationCodes.length;
-      const M = permanent.length;
+      const cooldown = codeRepeatCooldown ?? rotationCodes.length;
+      // Phantom (needs-manual-coverage) slots and PRN coverage are
+      // locked the same as pinned shifts/continuity blocks — none of
+      // these are "just a regular already-working pair" eligible to
+      // swap with anyone.
+      const isLocked = (info) => info.fixed || info.pinned || info.phantom || info.type === "extra";
 
-      if (N > 0 && M > 0) {
-        // Clear every non-locked weekday rotation slot FIRST, across the
-        // whole schedule, before filling anything in. Without this, a
-        // day being filled early in the walk would still see its LATER,
-        // not-yet-reprocessed weekdays holding their old leftover
-        // assignments — artificially inflating "how much has this
-        // person already worked" for the cap/consecutive-day checks
-        // below, since those stale future days haven't actually been
-        // decided yet. Pinned shifts, continuity blocks, and anyone's
-        // approved PTO-1 stay — a plain PTO-2 override isn't one of the
-        // non-negotiables, so it's cleared and rebuilt like any other
-        // slot.
-        const isLocked = (info) => info.fixed || info.pinned;
-        workingDays.forEach((day) => {
-          if (day.dow === 0 || day.dow === 6 || holidays.has(day.iso)) return;
-          rotationCodes.forEach((code) => {
-            const info = day.assignment[code];
-            if (info && !isLocked(info)) delete day.assignment[code];
-          });
-          day.holes = holesOnDay(day);
+      // Total "early repeat" severity across the whole schedule — the
+      // thing each trial swap is trying to lower. A repeat 1 turn too
+      // soon costs less than one 5 turns too soon, so the search can
+      // tell "slightly bad" from "very bad," not just count violations.
+      const spacingCost = (daysArr) => {
+        let cost = 0;
+        permanent.forEach((e) => {
+          const worked = workedDayIndicesFromSchedule(daysArr, e.id).sort((a, b) => a - b);
+          const codeForDay = (d) => {
+            const entry = Object.entries(daysArr[d].assignment).find(([, info]) => info.empId === e.id);
+            return entry ? overflowBaseCode(entry[0]) : null;
+          };
+          codeRepeatGaps(worked, codeForDay).forEach((g) => { if (g !== null) cost += Math.max(0, cooldown - g); });
         });
+        return cost;
+      };
 
-        let workdayCounter = 0;
-        workingDays.forEach((day) => {
-          const isWeekend = day.dow === 0 || day.dow === 6;
-          if (isWeekend || holidays.has(day.iso)) return; // never touched, at all
+      let current = schedule.days.map((d) => ({ ...d, assignment: { ...d.assignment } }));
+      let currentCost = spacingCost(current);
+      const weekdayIndices = current
+        .map((d) => d.idx)
+        .filter((idx) => current[idx].dow !== 0 && current[idx].dow !== 6 && !holidays.has(current[idx].iso));
 
-          // Non-negotiables already sitting on this day (survived the
-          // clear above): leave them alone, and don't also hand that
-          // same person a second, rotation-driven shift today.
-          const lockedEmpIds = new Set();
-          const lockedCodesToday = new Set();
-          Object.entries(day.assignment).forEach(([code, info]) => {
-            if (isLocked(info)) { lockedEmpIds.add(info.empId); lockedCodesToday.add(code); }
-          });
+      if (weekdayIndices.length > 0 && rotationCodes.length > 1) {
+        const ITERATIONS = 2500;
+        for (let iter = 0; iter < ITERATIONS; iter++) {
+          const dayIdx = weekdayIndices[Math.floor(Math.random() * weekdayIndices.length)];
+          const day = current[dayIdx];
+          const entries = Object.entries(day.assignment).filter(([code, info]) => info.type === "permanent" && !isLocked(info) && rotationCodes.includes(code));
+          if (entries.length < 2) continue;
+          const i1 = Math.floor(Math.random() * entries.length);
+          let i2 = Math.floor(Math.random() * entries.length);
+          if (i2 === i1) i2 = (i2 + 1) % entries.length;
+          const [codeA, infoA] = entries[i1];
+          const [codeB, infoB] = entries[i2];
+          if (infoA.empId === infoB.empId) continue;
+          const empA = permanent.find((p) => p.id === infoA.empId);
+          const empB = permanent.find((p) => p.id === infoB.empId);
+          if (!empA || !empB || !empA.allowedShifts.includes(codeB) || !empB.allowedShifts.includes(codeA)) continue;
 
-          const windowStart = workdayCounter % M;
-          const activeCount = Math.min(N, M);
-          const idealIndexFor = (p) => (p + workdayCounter) % N;
-          const activePeople = Array.from({ length: activeCount }, (_, k) => (windowStart + k) % M)
-            .map((p) => ({ p, emp: permanent[p] }))
-            .filter(({ emp }) => !lockedEmpIds.has(emp.id))
-            .sort((a, b) => idealIndexFor(a.p) - idealIndexFor(b.p) || a.p - b.p);
-
-          const takenCodes = new Set(lockedCodesToday);
-          activePeople.forEach(({ p, emp }) => {
-            let idx = idealIndexFor(p);
-            for (let attempt = 0; attempt < N; attempt++) {
-              const code = rotationCodes[idx];
-              const ptoHere = ptoStatus[key(emp.id, day.idx)];
-              const worked = workedDayIndicesFromSchedule(workingDays, emp.id);
-              const eligible = !takenCodes.has(code)
-                && emp.allowedShifts.includes(code)
-                && ptoHere !== "PTO1"
-                && respectsFixedDayRestriction(emp, [day.dow])
-                && !wouldExceedShiftCap(emp, worked, [day.idx], capForBlock(emp))
-                && !(consecutiveHardLimit && wouldExceedConsecutiveDays(worked, [day.idx], maxConsecutiveDays));
-              if (eligible) {
-                day.assignment[code] = { empId: emp.id, type: "permanent", override: ptoHere === "PTO2", fixed: false };
-                takenCodes.add(code);
-                break;
-              }
-              idx = (idx + 1) % N;
-            }
-            // No safe, eligible code found anywhere in the rotation for
-            // them today — they're simply OFF; the slot(s) that
-            // couldn't be filled show up as ordinary coverage gaps.
-          });
-
-          day.holes = holesOnDay(day);
-          workdayCounter++;
-        });
+          const trialDays = current.slice();
+          const trialDay = { ...day, assignment: { ...day.assignment } };
+          const ptoA = ptoStatus[key(infoA.empId, dayIdx)] === "PTO2";
+          const ptoB = ptoStatus[key(infoB.empId, dayIdx)] === "PTO2";
+          trialDay.assignment[codeA] = { empId: infoB.empId, type: "permanent", override: ptoB, fixed: false };
+          trialDay.assignment[codeB] = { empId: infoA.empId, type: "permanent", override: ptoA, fixed: false };
+          trialDays[dayIdx] = trialDay;
+          const trialCost = spacingCost(trialDays);
+          if (trialCost <= currentCost) { current = trialDays; currentCost = trialCost; }
+        }
       }
 
-      const updated = { ...schedule, ...buildScheduleDerived(workingDays), costAfter: costOf(workingDays, workingDays.length) };
+      const updated = { ...schedule, ...buildScheduleDerived(current), costAfter: costOf(current, current.length) };
       setSchedule(updated);
       setManualEditWarnings([]);
       setKickedOutCells(new Set());
@@ -2113,6 +2126,28 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     setMissingShiftReport(null);
     setDismissedAlerts(new Set());
     saveScheduleSnapshot(previous, viewingOwnerId).catch(reportSyncError);
+  };
+
+  // "Fairness check" — a pure re-scan, never a regenerate. Re-tabulates
+  // every fairness number (the per-employee table, the new distribution
+  // & streak summary, continuity/cap/fixed-day violations — all of
+  // buildScheduleDerived) straight from whatever's on the grid right
+  // now, however it got there: Regenerate-N, a drag, a gap fill, any
+  // mix. Most of that already updates live on every edit — the one
+  // number that doesn't is the top banner's "before optimizer" fairness
+  // score, which Regenerate-N never sets and which otherwise keeps
+  // showing a stale baseline from whenever Generate last actually ran.
+  // This measures the CURRENT grid fresh and uses that single number
+  // for both sides, with iterations zeroed out so the banner reads as
+  // "this is where things stand" instead of a misleading before/after.
+  // Doesn't touch a single assignment, so it isn't pushed onto the undo
+  // history — there's nothing here to undo.
+  const checkFairness = () => {
+    if (!schedule) return;
+    const freshCost = costOf(schedule.days, schedule.days.length);
+    const updated = { ...schedule, ...buildScheduleDerived(schedule.days), costBefore: freshCost, costAfter: freshCost, iterations: 0 };
+    setSchedule(updated);
+    saveScheduleSnapshot(updated, viewingOwnerId).catch(reportSyncError);
   };
 
   // Manual drag-and-drop editing of an already-generated schedule. A
@@ -2243,11 +2278,23 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   // action in this app.
   const saveToSlot = (slot) => {
     if (!schedule) return;
-    if (scheduleSlots[slot] && !window.confirm(`Slot ${slot} already has a saved schedule from ${new Date(scheduleSlots[slot].savedAt).toLocaleString()}. Overwrite it with the current schedule?`)) return;
+    if (scheduleSlots[slot] && !window.confirm(`${slotLabel(slot)} already has a saved schedule from ${new Date(scheduleSlots[slot].savedAt).toLocaleString()}. Overwrite it with the current schedule?`)) return;
     const savedAt = new Date().toISOString();
-    setScheduleSlots((prev) => ({ ...prev, [slot]: { snapshot: schedule, savedAt } }));
-    saveScheduleSlot(slot, schedule, viewingOwnerId).catch(reportSyncError);
+    const name = scheduleSlots[slot]?.name || null;
+    setScheduleSlots((prev) => ({ ...prev, [slot]: { snapshot: schedule, savedAt, name } }));
+    saveScheduleSlot(slot, schedule, viewingOwnerId, name).catch(reportSyncError);
   };
+  // Renaming only ever touches the `name` column — the saved snapshot and
+  // its timestamp are left exactly as they were.
+  const renameSlot = (slot) => {
+    const current = scheduleSlots[slot]?.name || "";
+    const input = window.prompt(`Name for Slot ${slot} (leave blank to use the default "File name ${slot}"):`, current);
+    if (input === null) return;
+    const name = input.trim() || null;
+    setScheduleSlots((prev) => ({ ...prev, [slot]: { ...prev[slot], name } }));
+    renameScheduleSlot(slot, name, viewingOwnerId).catch(reportSyncError);
+  };
+  const slotLabel = (slot) => scheduleSlots[slot]?.name || `File name ${slot}`;
   // Loading a slot replaces the active schedule outright — same as
   // Regenerate, any unsaved manual edits on screen are gone. It also
   // becomes the new auto-saved "current" schedule, so it's what's there
@@ -3015,9 +3062,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                   <li><b>"Fill a coverage gap" card</b> — appears whenever there are HOLEs. Pick anyone — permanent or PRN — from the dropdown next to each empty shift to assign it directly, no dragging needed. Same rules as a drag swap: can't double-book someone or drop them on approved leave, but an untrained or over-limit pick still goes through with a warning.</li>
                   <li><b>"Add overflow (E0) coverage"</b> — always visible, right below the gap card, since E0 is never a HOLE and so never shows up there. Pick any day, then any permanent employee free that day, to pad them onto E0 as an extra cushion body — before a shortfall shows up, not after. Stacks alongside anyone already on E0 that day rather than replacing them.</li>
                   <li><b>Export CSV</b> turns it into a spreadsheet, including any manual swaps or gap-fills you've made. <b>Regenerate</b> reruns the optimizer from scratch if you want another pass — this discards any manual edits.</li>
-                  <li><b>Regenerate-N</b> — a completely different, much simpler pass: only weekdays get rebuilt, as a plain rotation through your shift list in the order they're set up under Manage Shifts (person 1 gets shift 1 Monday, shift 2 Tuesday, person 2 gets shift 2 Monday, shift 3 Tuesday, and so on, wrapping back to shift 1 once you run past the last one). Weekends, holidays, pinned shifts, continuity blocks, and anyone's approved PTO-1 are never touched — whatever's there stays exactly as it was. Training, PTO, caps, and the consecutive-day limit are still enforced; if the rotation's exact pick for someone isn't safe that day, it moves to the next open shift they can safely take instead, or they're simply OFF that day if nothing fits. With more employees than shift codes, not everyone works every weekday — who's resting rotates too, so it's an equal share for everyone over time, not always the same people left out. No fairness pass runs afterward, so the plain rotation pattern stays visible.</li>
+                  <li><b>Regenerate-N</b> — reshuffles what's already on screen, it never decides who works which days. Nobody's total shift count for any pay period changes, because nobody's set of worked days changes — all it does is swap which <i>code</i> two people already working the same day are down for, whenever that spreads repeats out more evenly. The target: nobody gets the exact same code again until <b>N</b> of their own other worked days have passed — N is a dropdown next to the button, defaulting to however many real shift codes you have (a full cycle through the list before any repeat), with looser options if you'd rather allow repeats sooner. It runs 2,500 random trial swaps, same shape as the real optimizer's own local search, keeping each one only if it doesn't make the overall spacing worse. A swap only ever happens between two people each trained for the other's code. Weekends, holidays, pinned shifts, continuity blocks, phantom (needs-manual-coverage) slots, and any existing PRN coverage are never touched — those aren't ordinary already-working pairs eligible to swap. Since nobody's worked-day set ever changes, there's nothing here that can create a gap, go over a cap, or need a PTO/consecutive-day check at all. Whatever repeats can't be fixed this way (nobody eligible has training for the other's code) stay as they were — not flagged on the grid, but counted honestly: see "Early repeats" in the Fairness Report.</li>
                   <li><b>↶ Undo</b> — steps backward through the last 10 schedule-changing actions this session: either Regenerate button, a drag, a gap fill, an overflow assign, or loading a save slot. The number in the button is how many steps are available. It's session-only — closing the tab or reloading clears it, same as the other in-progress highlights on this tab — so it's a short-term "oops" safety net, not a permanent history. Save Slots are still the way to keep something indefinitely.</li>
-                  <li><b>Save to Slot 1 / Slot 2</b> — keeps a copy of exactly what's on screen right now (including manual edits) in one of two slots, safe from the next Regenerate or edit. Click a saved slot to load it back as the active schedule — unsaved changes on screen are lost, same as Regenerate. Saving over an already-used slot asks you to confirm first.</li>
+                  <li><b>✓ Fairness check</b> — a pure re-scan, not a regenerate: it never changes a single assignment. Most of the Fairness Report already updates live on every edit, but Regenerate-N never sets the "fairness score before optimizer" banner at the top of this tab, so after using it that banner keeps showing a stale number from whenever Generate last actually ran. This button measures the grid exactly as it stands right now and replaces that banner with a fresh, accurate reading.</li>
+                  <li><b>Save to File name 1 / File name 2</b> — keeps a copy of exactly what's on screen right now (including manual edits) in one of two slots, safe from the next Regenerate or edit. Click a saved slot to load it back as the active schedule — unsaved changes on screen are lost, same as Regenerate. Saving over an already-used slot asks you to confirm first. The ✏️ next to a saved slot lets you give it a custom name (e.g. "Before holidays") in place of the default "File name 1"/"File name 2" label — renaming never touches the saved schedule itself.</li>
                   <li><b>Scan for missing shifts</b> — a separate, on-demand check: scans every permanent employee's CURRENT grid (after any manual edits, whatever caused them) for anyone under their own pay-period minimum, PTO-1 counted toward it the same way the generator counts it, and flags the single best open day per shortfall with a dotted amber "+" cell — preferring a day that already has a real coverage gap they're trained for, and otherwise the one that creates the fewest lonely shifts or lonely days off and avoids cutting into an off-weekend. It only flags; it never assigns anything for you. Click it again any time — each click replaces the flagged cells with a fresh scan of what's on screen right now.</li>
                 </ul>
                 <img src="/instructions/schedule-grid.png" alt="Schedule grid with fairness score, a warning about unfillable shifts, the legend, and export/regenerate buttons" className="w-full rounded border border-[#E4E7EC] mb-2" />
@@ -3786,9 +3834,15 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         {tab === "schedule" && schedule && (
           <div className="space-y-3">
             <div className="bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46] text-xs rounded px-3 py-2 flex flex-wrap gap-4">
-              <span>Fairness score before optimizer: <b>{schedule.costBefore.toFixed(1)}</b></span>
-              <span>→ after {schedule.iterations.toLocaleString()} passes: <b>{schedule.costAfter.toFixed(1)}</b></span>
-              <span>({schedule.costBefore > 0 ? Math.round((1 - schedule.costAfter / schedule.costBefore) * 100) : 0}% improvement)</span>
+              {schedule.iterations > 0 ? (
+                <>
+                  <span>Fairness score before optimizer: <b>{schedule.costBefore.toFixed(1)}</b></span>
+                  <span>→ after {schedule.iterations.toLocaleString()} passes: <b>{schedule.costAfter.toFixed(1)}</b></span>
+                  <span>({schedule.costBefore > 0 ? Math.round((1 - schedule.costAfter / schedule.costBefore) * 100) : 0}% improvement)</span>
+                </>
+              ) : (
+                <span>Current fairness score (as of your last change): <b>{schedule.costAfter.toFixed(1)}</b> — no optimizer pass has run against this exact grid; click "Fairness check" any time to re-tabulate.</span>
+              )}
             </div>
             {schedule.totalHoles > 0 && (
               <AlertBox tone="critical" dismissKey={`holes:${schedule.totalHoles}`}>
@@ -3850,12 +3904,6 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <AlertBox tone="advisory" dismissKey={`pinnedWarn:${schedule.pinnedShiftWarnings.join("|")}`}>
                 ℹ {schedule.pinnedShiftWarnings.length} pinned shift(s) scheduled for someone not trained on that code:
                 <AlertList items={schedule.pinnedShiftWarnings} />
-              </AlertBox>
-            )}
-            {schedule.autoRearrangedLosses?.length > 0 && (
-              <AlertBox tone="advisory" dismissKey={`autoRearranged:${schedule.autoRearrangedLosses.join("|")}`}>
-                ℹ {schedule.autoRearrangedLosses.length} shift(s) were handed to someone else during generation, leaving the original person short — look for the dashed amber "−" cells below:
-                <AlertList items={schedule.autoRearrangedLosses} />
               </AlertBox>
             )}
             {manualEditWarnings.length > 0 && (
@@ -3996,15 +4044,18 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                           title={`Load this schedule, saved ${new Date(scheduleSlots[slot].savedAt).toLocaleString()}. Replaces what's on screen now — unsaved manual edits are lost.`}
                           className="px-3 py-1.5 text-xs font-semibold rounded border border-[#64748B] text-[#64748B] hover:bg-[#64748B] hover:text-white"
                         >
-                          📂 Slot {slot} · {new Date(scheduleSlots[slot].savedAt).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })} {new Date(scheduleSlots[slot].savedAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}
+                          📂 {slotLabel(slot)} · {new Date(scheduleSlots[slot].savedAt).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })} {new Date(scheduleSlots[slot].savedAt).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}
                         </button>
-                        <button onClick={() => saveToSlot(slot)} title={`Overwrite Slot ${slot} with the current schedule`} className="px-2 py-1.5 text-xs rounded border border-[#E4E7EC] text-[#64748B] hover:bg-[#F8FAFC]">
+                        <button onClick={() => renameSlot(slot)} title={`Rename ${slotLabel(slot)}`} className="px-2 py-1.5 text-xs rounded border border-[#E4E7EC] text-[#64748B] hover:bg-[#F8FAFC]">
+                          ✏️
+                        </button>
+                        <button onClick={() => saveToSlot(slot)} title={`Overwrite ${slotLabel(slot)} with the current schedule`} className="px-2 py-1.5 text-xs rounded border border-[#E4E7EC] text-[#64748B] hover:bg-[#F8FAFC]">
                           💾
                         </button>
                       </>
                     ) : (
                       <button onClick={() => saveToSlot(slot)} title="Save the current schedule here to come back to later — regenerating or editing won't touch it" className="px-3 py-1.5 text-xs font-semibold rounded border border-[#E4E7EC] text-[#64748B] hover:bg-[#F8FAFC]">
-                        💾 Save to Slot {slot}
+                        💾 Save to File name {slot}
                       </button>
                     )}
                   </div>
@@ -4019,13 +4070,33 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <button onClick={generate} disabled={generating} className="px-3 py-1.5 text-xs font-semibold rounded bg-[#0D9488] text-white hover:bg-[#0B6B62] disabled:opacity-50">
                 {generating ? "Working…" : "↻ Regenerate"}
               </button>
+              <span className="flex items-center gap-1 text-xs text-[#64748B]">
+                <label htmlFor="code-repeat-cooldown" title="How many of an employee's own other worked days must pass before the same shift code can land on them again. Defaults to a full cycle through your current shift list.">N:</label>
+                <select
+                  id="code-repeat-cooldown"
+                  value={codeRepeatCooldown ?? rotationCodes.length}
+                  onChange={(e) => setCodeRepeatCooldown(Number(e.target.value))}
+                  className="border border-[#E4E7EC] rounded px-1.5 py-1"
+                >
+                  {[0, -2, -4, -6].map((delta) => rotationCodes.length + delta).filter((n) => n >= 1).map((n) => (
+                    <option key={n} value={n}>{n}{n === rotationCodes.length ? " (full cycle)" : ""}</option>
+                  ))}
+                </select>
+              </span>
               <button
                 onClick={regenerateByRotation}
                 disabled={generatingRotation}
-                title="Rebuilds only the weekdays as a plain rotation through your shift list (person 1 gets shift 1 Monday, shift 2 Tuesday, wrapping forever) — training, PTO, caps, and the consecutive-day limit are still enforced. Weekends, holidays, pins, continuity blocks, and approved PTO-1 are never touched. No fairness pass runs afterward."
+                title={`Reshuffles what's already on screen — never decides who works which days, so nobody's total shift count changes. Swaps which code two people already working the same day are down for, whenever that gets them closer to N (${codeRepeatCooldown ?? rotationCodes.length}, pick it from the dropdown) of their own other worked days since that exact code last landed on them. Only swaps people each trained for the other's code. Weekends, holidays, pins, continuity blocks, phantom slots, and PRN coverage are never touched. Repeats that can't be fixed this way aren't flagged on the grid — "Fairness check" counts them as Early repeats instead.`}
                 className="px-3 py-1.5 text-xs font-semibold rounded border border-[#7C3AED] text-[#7C3AED] hover:bg-[#7C3AED] hover:text-white disabled:opacity-50"
               >
                 {generatingRotation ? "Rotating…" : "Regenerate-N"}
+              </button>
+              <button
+                onClick={checkFairness}
+                title="Pure re-scan, no changes to the grid — re-tabulates every fairness number (the Fairness Report table, the distribution & streak summary, every violation check) from whatever's on screen right now, and replaces the top banner's fairness score with a fresh current reading instead of a stale one left over from the last real Generate."
+                className="px-3 py-1.5 text-xs font-semibold rounded border border-[#0D9488] text-[#0D9488] hover:bg-[#0D9488] hover:text-white"
+              >
+                ✓ Fairness check
               </button>
               <button
                 onClick={undoLastChange}
@@ -4068,13 +4139,14 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
 
             <div className="bg-white rounded-lg border border-[#E4E7EC] p-4">
               <div className="text-sm font-semibold mb-2">Shift distribution & longest streak</div>
-              <p className="text-xs text-[#64748B] mb-3">A quick look at how evenly shifts spread out per person, and the longest run of back-to-back days anyone worked — handy right after Regenerate-N to eyeball how even the rotation came out. <b>Total</b> is every shift they're actually down for however it got there — pinned shifts and weekend shifts count toward it too, same as a plain rotation pick. The full table below also has PTO, lonely days, and missing-shift-type detail.</p>
+              <p className="text-xs text-[#64748B] mb-3">A quick look at how evenly shifts spread out per person, and the longest run of back-to-back days anyone worked — handy right after Regenerate-N to eyeball how even the rotation came out. <b>Total</b> is every shift they're actually down for however it got there — pinned shifts and weekend shifts count toward it too, same as a plain rotation pick. <b>Early repeats</b> is how many times they got the exact same shift code again before working through {codeRepeatCooldown ?? rotationCodes.length} of their own other turns first — the "was it evenly spaced out, not just evenly counted" check. The full table below also has PTO, lonely days, and missing-shift-type detail.</p>
               <table className="text-xs border-collapse w-full">
                 <thead>
                   <tr className="bg-[#F7F8FA]">
                     <th className="text-left px-3 py-2 border-b border-[#E4E7EC]">Employee</th>
                     <th className="px-2 py-2 border-b border-[#E4E7EC]">Total</th>
                     <th className="px-2 py-2 border-b border-[#E4E7EC]">Longest streak</th>
+                    <th className="px-2 py-2 border-b border-[#E4E7EC]" title={`How many times the same shift code repeated for them before ${codeRepeatCooldown ?? rotationCodes.length} of their own other turns had passed`}>Early repeats</th>
                     <th className="px-3 py-2 border-b border-[#E4E7EC] text-left">Distribution</th>
                   </tr>
                 </thead>
@@ -4091,6 +4163,7 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                         <td className="px-3 py-1.5 border-b border-[#F1F5F9] font-medium">{f.name}</td>
                         <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center font-semibold">{f.total}</td>
                         <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">{f.longestRun} day{f.longestRun === 1 ? "" : "s"}{f.longestRunExceeded && <span title={`Worked ${f.longestRun} days in a row — over your ${maxConsecutiveDays}-day preference`} className="text-[#DC2626] ml-1">⚠</span>}</td>
+                        <td className="px-2 py-1.5 border-b border-[#F1F5F9] text-center">{f.earlyRepeats > 0 ? <span className="text-[#CA8A04] font-semibold">{f.earlyRepeats}</span> : <span className="text-[#0D9488]">0</span>}</td>
                         <td className="px-3 py-1.5 border-b border-[#F1F5F9]">
                           <div className="flex items-end gap-1.5">
                             {displayCodes.map((s) => (

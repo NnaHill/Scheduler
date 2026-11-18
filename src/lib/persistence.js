@@ -308,12 +308,17 @@ export async function fetchScheduleSnapshot(ownerId) {
 // when the manager explicitly saves into it, so it's safe to keep a
 // schedule around to compare against or fall back to later.
 export async function fetchScheduleSlots(ownerId) {
-  const { data, error } = await supabase.from("schedule_save_slots").select("slot, snapshot, saved_at").eq("owner_id", ownerId);
+  const { data, error } = await supabase.from("schedule_save_slots").select("slot, snapshot, saved_at, name").eq("owner_id", ownerId);
   if (error) throw error;
   return data || [];
 }
-export async function saveScheduleSlot(slot, snapshot, ownerId) {
-  const { error } = await supabase.from("schedule_save_slots").upsert({ slot, snapshot, owner_id: ownerId, saved_at: new Date().toISOString() }, { onConflict: "owner_id,slot" });
+export async function saveScheduleSlot(slot, snapshot, ownerId, name = null) {
+  const { error } = await supabase.from("schedule_save_slots").upsert({ slot, snapshot, owner_id: ownerId, saved_at: new Date().toISOString(), name }, { onConflict: "owner_id,slot" });
+  if (error) throw error;
+}
+// Renames a slot without touching its saved snapshot or saved_at.
+export async function renameScheduleSlot(slot, name, ownerId) {
+  const { error } = await supabase.from("schedule_save_slots").update({ name }).eq("owner_id", ownerId).eq("slot", slot);
   if (error) throw error;
 }
 export async function deleteScheduleSlot(slot, ownerId) {

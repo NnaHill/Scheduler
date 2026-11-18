@@ -17,6 +17,7 @@ import {
   wouldExceedConsecutiveDays,
   countLonelyDaysOff,
   countLonelyShifts,
+  codeRepeatGaps,
   countBackToBackSameShift,
   unfilledShifts,
   maxShiftsUnderCap,
@@ -512,6 +513,32 @@ describe("countLonelyShifts", () => {
   });
   test("alternating work and off makes every workday lonely", () => {
     expect(countLonelyShifts([1, 3, 5], 7)).toBe(3);
+  });
+});
+
+describe("codeRepeatGaps", () => {
+  test("a code worked for the first time has no gap (null)", () => {
+    expect(codeRepeatGaps([3], () => "E1")).toEqual([null]);
+  });
+  test("a different code every turn is always a first-time null", () => {
+    const codeForDay = { 0: "E1", 1: "E2", 2: "E3" };
+    expect(codeRepeatGaps([0, 1, 2], (d) => codeForDay[d])).toEqual([null, null, null]);
+  });
+  test("gap is the number of turns since that exact code last appeared", () => {
+    // Turn 0: E1, turn 1: E2, turn 2: E1 again — 2 turns since the last E1 (turn 0).
+    const codeForDay = { 5: "E1", 9: "E2", 12: "E1" };
+    expect(codeRepeatGaps([5, 9, 12], (d) => codeForDay[d])).toEqual([null, null, 2]);
+  });
+  test("back-to-back repeat of the same code is a gap of 1", () => {
+    expect(codeRepeatGaps([1, 2], () => "E1")).toEqual([null, 1]);
+  });
+  test("tracks each code's own gap independently", () => {
+    // E1,E2,E1,E2 — both repeat on their very next opportunity (gap 2 each).
+    const codeForDay = { 0: "E1", 1: "E2", 2: "E1", 3: "E2" };
+    expect(codeRepeatGaps([0, 1, 2, 3], (d) => codeForDay[d])).toEqual([null, null, 2, 2]);
+  });
+  test("empty input gives an empty result", () => {
+    expect(codeRepeatGaps([], () => "E1")).toEqual([]);
   });
 });
 
