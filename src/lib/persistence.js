@@ -64,6 +64,14 @@ export async function deleteEmployee(id, ownerId) {
   const { error } = await supabase.from("employees").delete().eq("id", id).eq("owner_id", ownerId);
   if (error) throw error;
 }
+// Admin import: wipes every employee of one type for an owner in one go.
+// pto_status/extra_availability/pinned_shifts/forced_holiday_work rows for
+// those employees cascade-delete automatically (each has an `on delete
+// cascade` FK to employees.id) — nothing else to clean up by hand.
+export async function deleteAllEmployeesOfType(type, ownerId) {
+  const { error } = await supabase.from("employees").delete().eq("owner_id", ownerId).eq("type", type);
+  if (error) throw error;
+}
 
 export async function fetchHolidays(ownerId) {
   const { data, error } = await supabase.from("holidays").select("day_iso").eq("owner_id", ownerId);
@@ -76,6 +84,10 @@ export async function addHolidayRow(iso, ownerId) {
 }
 export async function removeHolidayRow(iso, ownerId) {
   const { error } = await supabase.from("holidays").delete().eq("day_iso", iso).eq("owner_id", ownerId);
+  if (error) throw error;
+}
+export async function deleteAllHolidays(ownerId) {
+  const { error } = await supabase.from("holidays").delete().eq("owner_id", ownerId);
   if (error) throw error;
 }
 
@@ -126,6 +138,10 @@ export async function upsertShiftDefinition(def, ownerId) {
 }
 export async function deleteShiftDefinition(code, ownerId) {
   const { error } = await supabase.from("shift_definitions").delete().eq("code", code).eq("owner_id", ownerId);
+  if (error) throw error;
+}
+export async function deleteAllShiftDefinitions(ownerId) {
+  const { error } = await supabase.from("shift_definitions").delete().eq("owner_id", ownerId);
   if (error) throw error;
 }
 
@@ -185,6 +201,13 @@ export async function deletePtoStatus(employeeId, iso, ownerId) {
     .eq("day_iso", iso);
   if (error) throw error;
 }
+// Admin import only — every row for an owner, not scoped to whatever date
+// window the UI happens to have open. The import copies an entire account.
+export async function fetchAllPtoStatus(ownerId) {
+  const { data, error } = await supabase.from("pto_status").select("employee_id, day_iso, status, source").eq("owner_id", ownerId);
+  if (error) throw error;
+  return data;
+}
 
 // "Force holiday work" tags — same shape/usage pattern as PTO's bulk
 // block/clear, but the opposite intent: existence of a row means this
@@ -213,6 +236,11 @@ export async function bulkDeleteForcedHolidayWork(employeeId, startIso, endIso, 
     .gte("day_iso", startIso)
     .lte("day_iso", endIso);
   if (error) throw error;
+}
+export async function fetchAllForcedHolidayWork(ownerId) {
+  const { data, error } = await supabase.from("forced_holiday_work").select("employee_id, day_iso").eq("owner_id", ownerId);
+  if (error) throw error;
+  return data;
 }
 
 // Manual shift pins — a manager hand-writes a specific shift code for a
@@ -243,6 +271,16 @@ export async function deletePinnedShift(employeeId, iso, ownerId) {
     .eq("employee_id", employeeId)
     .eq("owner_id", ownerId)
     .eq("day_iso", iso);
+  if (error) throw error;
+}
+export async function fetchAllPinnedShifts(ownerId) {
+  const { data, error } = await supabase.from("pinned_shifts").select("employee_id, day_iso, code").eq("owner_id", ownerId);
+  if (error) throw error;
+  return data;
+}
+export async function bulkUpsertPinnedShifts(rows) {
+  if (rows.length === 0) return;
+  const { error } = await supabase.from("pinned_shifts").upsert(rows, { onConflict: "employee_id,day_iso" });
   if (error) throw error;
 }
 
@@ -289,6 +327,11 @@ export async function bulkDeleteExtraAvailability(employeeId, startIso, endIso, 
     .lte("day_iso", endIso);
   if (error) throw error;
 }
+export async function fetchAllExtraAvailability(ownerId) {
+  const { data, error } = await supabase.from("extra_availability").select("employee_id, day_iso").eq("owner_id", ownerId);
+  if (error) throw error;
+  return data;
+}
 
 // One row per manager — each save overwrites it, so there's nothing to
 // clean up over time, and the app can read it back on login to restore
@@ -301,6 +344,12 @@ export async function fetchScheduleSnapshot(ownerId) {
   const { data, error } = await supabase.from("saved_schedules").select("snapshot").eq("owner_id", ownerId).maybeSingle();
   if (error) throw error;
   return data?.snapshot || null;
+}
+// `snapshot` is NOT NULL, so clearing the active schedule is a real row
+// delete, not an upsert with a null snapshot (which Postgres would reject).
+export async function deleteScheduleSnapshot(ownerId) {
+  const { error } = await supabase.from("saved_schedules").delete().eq("owner_id", ownerId);
+  if (error) throw error;
 }
 
 // Two named save slots per manager (1 and 2) — unlike saved_schedules

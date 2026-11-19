@@ -4,28 +4,36 @@ import {
   insertEmployee,
   upsertEmployee,
   deleteEmployee,
+  deleteAllEmployeesOfType,
   fetchHolidays,
   addHolidayRow,
   removeHolidayRow,
+  deleteAllHolidays,
   fetchPtoStatus,
   upsertPtoStatus,
   deletePtoStatus,
   bulkUpsertPtoStatus,
   bulkDeletePtoStatus,
   clearPtoStatusForDates,
+  fetchAllPtoStatus,
   fetchForcedHolidayWork,
   bulkUpsertForcedHolidayWork,
   bulkDeleteForcedHolidayWork,
+  fetchAllForcedHolidayWork,
   fetchPinnedShifts,
   upsertPinnedShift,
   deletePinnedShift,
+  fetchAllPinnedShifts,
+  bulkUpsertPinnedShifts,
   fetchExtraAvailability,
   addExtraAvailabilityRow,
   removeExtraAvailabilityRow,
   bulkUpsertExtraAvailability,
   bulkDeleteExtraAvailability,
+  fetchAllExtraAvailability,
   saveScheduleSnapshot,
   fetchScheduleSnapshot,
+  deleteScheduleSnapshot,
   fetchScheduleSlots,
   saveScheduleSlot,
   renameScheduleSlot,
@@ -34,6 +42,7 @@ import {
   insertShiftDefinitions,
   upsertShiftDefinition,
   deleteShiftDefinition,
+  deleteAllShiftDefinitions,
 } from "./lib/persistence";
 import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
@@ -183,6 +192,24 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [allProfiles, setAllProfiles] = useState([]);
   const reportSyncError = (err) => { console.error(err); setSyncError(err.message || String(err)); };
 
+  // Admin-only "Import" tab: copies another account's data into whichever
+  // account is currently being viewed/edited (viewingOwnerId), overwriting
+  // just the sections checked. Schedule only makes sense together with a
+  // matching Permanent+PRN roster (the grid is full of bare employee IDs
+  // with no meaning on their own), so picking it forces both on.
+  const [importSourceId, setImportSourceId] = useState("");
+  const [importSections, setImportSections] = useState({ setup: false, permanent: false, prn: false, schedule: false });
+  const [importRunning, setImportRunning] = useState(false);
+  const [importResult, setImportResult] = useState(null); // { summary: string[], error: string|null } | null
+  const toggleImportSection = (section) => {
+    setImportSections((prev) => {
+      const next = { ...prev, [section]: !prev[section] };
+      if (section === "schedule" && next.schedule) { next.permanent = true; next.prn = true; }
+      if ((section === "permanent" || section === "prn") && !next[section] && prev.schedule) { next.schedule = false; }
+      return next;
+    });
+  };
+
   // Per-cell write queue for the PTO grid's click-to-cycle — a cell's
   // status now spans TWO tables (pto_status, forced_holiday_work), so a
   // transition's writes have to land in the same order the clicks
@@ -303,6 +330,136 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     })();
     return () => { cancelled = true; };
   }, [viewingOwnerId]);
+
+  // Admin import: copies one or more sections of importSourceId's account
+  // into whatever account is currently being viewed (viewingOwnerId),
+  // overwriting that destination's data for every section checked. Employee
+  // IDs are a single sequence shared by every account, not owner-scoped, so
+  // copying an employee means inserting a fresh row (new ID) and remapping
+  // every place the OLD id was referenced — the PTO/pin/forced-work/
+  // availability tables, and the bare empId numbers buried inside a
+  // schedule snapshot's JSON, which Postgres has no idea refer to employees
+  // at all. idMap carries that old-id -> new-id translation through the
+  // whole run.
+  const runImport = async () => {
+    if (!importSourceId || importSourceId === viewingOwnerId || importRunning) return;
+    const sections = importSections;
+    if (!sections.setup && !sections.permanent && !sections.prn && !sections.schedule) return;
+    const sourceName = allProfiles.find((p) => p.id === importSourceId)?.name || "that account";
+    const destName = viewingOwnerId === session.user.id ? "your own account" : (allProfiles.find((p) => p.id === viewingOwnerId)?.name || "this account");
+    const pieces = [
+      sections.setup && "Setup (shift list, holidays, rotation settings)",
+      sections.permanent && "Permanent staff",
+      sections.prn && "PRN staff",
+      sections.schedule && "Schedule",
+    ].filter(Boolean);
+    if (!window.confirm(`Import ${pieces.join(", ")} from ${sourceName} into ${destName}?\n\nThis OVERWRITES the current data in ${destName} for everything checked, and cannot be undone.`)) return;
+
+    setImportRunning(true);
+    setImportResult(null);
+    const importSummary = [];
+    // Old employee id (in importSourceId's account) -> new id (freshly
+    // inserted under viewingOwnerId) — only populated for employees this
+    // run actually imported.
+    const idMap = {};
+    try {
+      if (sections.setup) {
+        const [srcDefs, srcHolidays] = await Promise.all([fetchShiftDefinitions(importSourceId), fetchHolidays(importSourceId)]);
+        await deleteAllShiftDefinitions(viewingOwnerId);
+        if (srcDefs.length > 0) await insertShiftDefinitions(srcDefs, viewingOwnerId);
+        await deleteAllHolidays(viewingOwnerId);
+        await Promise.all(srcHolidays.map((iso) => addHolidayRow(iso, viewingOwnerId)));
+        importSummary.push(`Setup: ${srcDefs.length} shift code(s), ${srcHolidays.length} holiday(s)`);
+      }
+
+      const importRoster = async (type, label) => {
+        const [srcEmployees, srcPto, srcForced, srcPins, srcAvail] = await Promise.all([
+          fetchEmployees(importSourceId),
+          fetchAllPtoStatus(importSourceId),
+          fetchAllForcedHolidayWork(importSourceId),
+          fetchAllPinnedShifts(importSourceId),
+          fetchAllExtraAvailability(importSourceId),
+        ]);
+        const srcOfType = srcEmployees.filter((e) => e.type === type);
+        await deleteAllEmployeesOfType(type, viewingOwnerId);
+        for (const emp of srcOfType) {
+          const inserted = await insertEmployee(emp, viewingOwnerId);
+          idMap[emp.id] = inserted.id;
+        }
+        const remapRows = (rows, extra = {}) => rows.filter((r) => idMap[r.employee_id] != null).map((r) => ({ ...r, employee_id: idMap[r.employee_id], owner_id: viewingOwnerId, ...extra }));
+        await bulkUpsertPtoStatus(remapRows(srcPto));
+        await bulkUpsertForcedHolidayWork(remapRows(srcForced));
+        await bulkUpsertPinnedShifts(remapRows(srcPins));
+        await bulkUpsertExtraAvailability(remapRows(srcAvail));
+        importSummary.push(`${label}: ${srcOfType.length} employee(s)`);
+      };
+      if (sections.permanent) await importRoster("permanent", "Permanent staff");
+      if (sections.prn) await importRoster("extra", "PRN staff");
+
+      if (sections.schedule) {
+        const srcSnapshot = await fetchScheduleSnapshot(importSourceId);
+        if (srcSnapshot) {
+          let droppedAssignments = 0;
+          const remapDays = srcSnapshot.days.map((day) => {
+            const assignment = {};
+            Object.entries(day.assignment).forEach(([code, info]) => {
+              if (info.empId == null) { assignment[code] = info; return; }
+              const newId = idMap[info.empId];
+              if (newId == null) { droppedAssignments++; return; }
+              assignment[code] = { ...info, empId: newId };
+            });
+            return { ...day, assignment };
+          });
+          const remapFairness = (list) => (list || []).filter((f) => idMap[f.id] != null).map((f) => ({ ...f, id: idMap[f.id] }));
+          const remappedSnapshot = { ...srcSnapshot, days: remapDays, fairness: remapFairness(srcSnapshot.fairness), extraFairness: remapFairness(srcSnapshot.extraFairness) };
+          await saveScheduleSnapshot(remappedSnapshot, viewingOwnerId);
+          applyScheduleSnapshot(remappedSnapshot);
+          importSummary.push(`Schedule: ${remapDays.length} day(s)${droppedAssignments > 0 ? ` (dropped ${droppedAssignments} assignment(s) whose employee no longer exists in the source)` : ""}`);
+        } else {
+          importSummary.push("Schedule: source account has no saved schedule — nothing to copy");
+        }
+      } else if (sections.permanent || sections.prn) {
+        // The roster just changed underneath whatever schedule is
+        // currently active here — its empId values point at employees
+        // that may no longer exist, so it can't be trusted. Clearing it
+        // is safer than leaving a grid full of broken references.
+        await deleteScheduleSnapshot(viewingOwnerId).catch(() => {});
+        setSchedule(null);
+        importSummary.push("Cleared the existing Schedule here — it referenced the roster that was just replaced");
+      }
+
+      if (sections.setup && !sections.schedule) {
+        const srcSettingsSnapshot = await fetchScheduleSnapshot(importSourceId).catch(() => null);
+        if (srcSettingsSnapshot) {
+          setNumWeeks(srcSettingsSnapshot.numWeeks);
+          setStartDate(srcSettingsSnapshot.startDate);
+          const s = srcSettingsSnapshot.settingsUsed || {};
+          setMaxConsecutiveDays(s.maxConsecutiveDays);
+          setConsecutiveHardLimit(s.consecutiveHardLimit);
+          setGroupDaysOff(s.groupDaysOff);
+          setAvoidLonelyShifts(s.avoidLonelyShifts);
+          setWeekendPairingEnabled(s.weekendPairingEnabled);
+          setExtendOffWeekends(!!s.extendOffWeekends);
+          setCushionShiftCodes(s.cushionShiftCodes || []);
+          importSummary.push("Setup: also carried over the rotation/generator settings from the source's saved schedule");
+        }
+      }
+
+      const [freshEmployees, freshHolidays, freshDefs] = await Promise.all([
+        fetchEmployees(viewingOwnerId), fetchHolidays(viewingOwnerId), fetchShiftDefinitions(viewingOwnerId),
+      ]);
+      setEmployees(freshEmployees);
+      setHolidays(new Set(freshHolidays));
+      setShiftDefinitions(freshDefs);
+
+      setImportResult({ summary: importSummary, error: null });
+    } catch (err) {
+      reportSyncError(err);
+      setImportResult({ summary: importSummary, error: err.message || String(err) });
+    } finally {
+      setImportRunning(false);
+    }
+  };
 
   const days = useMemo(() => {
     const start = new Date(startDate + "T00:00:00");
@@ -2924,10 +3081,10 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
         </header>
 
         <div className="flex gap-2 mb-6 border-b border-[#E4E7EC] flex-wrap print-hide">
-          {["instructions", "setup", "permanent", "extra", "schedule", "fairness", "optimization"].map((t) => (
-            <button key={t} onClick={() => (t === "instructions" || t === "setup" || t === "permanent" || t === "extra" || schedule) && setTab(t)}
+          {["instructions", "setup", "permanent", "extra", "schedule", "fairness", "optimization", ...(profile.role === "admin" ? ["import"] : [])].map((t) => (
+            <button key={t} onClick={() => (t === "instructions" || t === "setup" || t === "permanent" || t === "extra" || t === "import" || schedule) && setTab(t)}
               className={`px-3 py-2 text-sm font-medium capitalize border-b-2 transition-colors ${tab === t ? "border-[#0D9488] text-[#0D9488]" : "border-transparent text-[#64748B] hover:text-[#1A2233]"} ${(t === "schedule" || t === "fairness" || t === "optimization") && !schedule ? "opacity-40 cursor-not-allowed" : "cursor-pointer"}`}>
-              {{ instructions: "1. Instructions", setup: "2. Setup", permanent: "3. Permanent Staff", extra: "4. PRN Staff", schedule: "5. Schedule", fairness: "6. Fairness Report", optimization: "7. Optimization" }[t]}
+              {{ instructions: "1. Instructions", setup: "2. Setup", permanent: "3. Permanent Staff", extra: "4. PRN Staff", schedule: "5. Schedule", fairness: "6. Fairness Report", optimization: "7. Optimization", import: "8. Import" }[t]}
             </button>
           ))}
         </div>
@@ -3588,6 +3745,11 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
                       {emp.shiftCap && emp.fixedDays.length > 0 && !emp.fixedDays.some((d) => d === 0 || d === 6) && (
                         <span className="text-[11px] text-[#7C3AED]">
                           Fixed days + hour cap already rule out weekends for this employee — rotation setting above has no effect either way.
+                        </span>
+                      )}
+                      {emp.fixedDays.some((d) => d === 0 || d === 6) && (
+                        <span className="text-[11px] text-[#7C3AED]">
+                          Saturday and/or Sunday is already a fixed work day for this employee — a locked commitment that always wins, so the rotation setting above has no effect on that day.
                         </span>
                       )}
                     </div>
@@ -4275,6 +4437,60 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               </div>
             )}
             <p className="text-xs text-[#64748B]">⚠ next to Weekends = that employee went more than 4 weeks without a weekend/holiday shift. ⚠ next to Longest streak = they worked more days in a row than your consecutive-days preference below allows.</p>
+          </div>
+        )}
+
+        {tab === "import" && profile.role === "admin" && (
+          <div className="space-y-4 max-w-2xl">
+            <div className="bg-[#EFF6FF] border border-[#BFDBFE] text-[#1E3A8A] text-xs rounded px-3 py-2">
+              Copies data from another account into whichever one you're currently viewing/editing above ({allProfiles.find((p) => p.id === viewingOwnerId)?.name || "you"}). Whatever's checked below gets completely overwritten there — this can't be undone.
+            </div>
+            <div className="bg-white rounded-lg border border-[#E4E7EC] p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <label className="text-sm font-semibold w-20">From:</label>
+                <select
+                  value={importSourceId}
+                  onChange={(e) => setImportSourceId(e.target.value)}
+                  className="border border-[#E4E7EC] rounded px-2 py-1.5 text-sm flex-1"
+                >
+                  <option value="">Choose an account…</option>
+                  {allProfiles.filter((p) => p.id !== viewingOwnerId).map((p) => (
+                    <option key={p.id} value={p.id}>{p.name || p.id}{p.role === "admin" ? " — admin" : ""}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1.5">
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={importSections.setup} onChange={() => toggleImportSection("setup")} />
+                  Setup <span className="text-xs text-[#64748B]">— shift list, holidays, and (if the source has a saved schedule) rotation/generator settings</span>
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={importSections.permanent} onChange={() => toggleImportSection("permanent")} />
+                  Permanent staff <span className="text-xs text-[#64748B]">— roster, PTO, pins, forced-holiday-work</span>
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={importSections.prn} onChange={() => toggleImportSection("prn")} />
+                  PRN staff <span className="text-xs text-[#64748B]">— roster, availability</span>
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={importSections.schedule} onChange={() => toggleImportSection("schedule")} />
+                  Schedule <span className="text-xs text-[#64748B]">— the active grid (also pulls in Permanent + PRN automatically — a schedule means nothing without the matching roster)</span>
+                </label>
+              </div>
+              <button
+                onClick={runImport}
+                disabled={!importSourceId || importRunning || !(importSections.setup || importSections.permanent || importSections.prn || importSections.schedule)}
+                className="px-4 py-2 text-sm font-semibold rounded bg-[#7C3AED] text-white hover:bg-[#6D28D9] disabled:opacity-50"
+              >
+                {importRunning ? "Importing…" : "⇩ Import"}
+              </button>
+            </div>
+            {importResult && (
+              <div className={`text-sm rounded px-3 py-2 ${importResult.error ? "bg-[#FEE2E2] border border-[#DC2626] text-[#991B1B]" : "bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46]"}`}>
+                {importResult.error ? <div className="font-semibold mb-1">Import failed partway through: {importResult.error}</div> : <div className="font-semibold mb-1">Import complete.</div>}
+                <AlertList items={importResult.summary} />
+              </div>
+            )}
           </div>
         )}
       </div>
