@@ -44,6 +44,7 @@ import {
   deleteShiftDefinition,
   deleteAllShiftDefinitions,
 } from "./lib/persistence";
+import { parseCsvText, buildAssignmentPlan } from "./lib/scheduleImport";
 import {
   toLocalISO, nextMonday, fmtLabel, key, shiftPref,
   wouldExceedShiftCap, maxShiftsInAnyPayPeriod, guaranteeTargetForBlock, workedDayIndicesFromSchedule, respectsFixedDayRestriction,
@@ -201,6 +202,15 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
   const [importSections, setImportSections] = useState({ setup: false, permanent: false, prn: false, schedule: false });
   const [importRunning, setImportRunning] = useState(false);
   const [importResult, setImportResult] = useState(null); // { summary: string[], error: string|null } | null
+
+  // Admin-only "Upload a schedule file" (same Import tab): replaces the
+  // active schedule from an uploaded CSV/XLSX in the same wide layout
+  // "Export CSV" produces, so an export can be hand-edited and
+  // re-uploaded. Matches rows by employee name and columns by day label
+  // against whatever roster/rotation-window is already configured here.
+  const [uploadRunning, setUploadRunning] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null); // { summary: string[], warnings: string[], error: string|null } | null
+  const fileInputRef = useRef(null);
   const toggleImportSection = (section) => {
     setImportSections((prev) => {
       const next = { ...prev, [section]: !prev[section] };
@@ -1715,6 +1725,93 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
     const guaranteeGaps = finalDays.reduce((sum, d) => sum + Object.values(d.assignment).filter((a) => a.phantom).length, 0);
 
     return { days: finalDays, fairness, extraFairness, totalHoles, totalOverrides, continuityCheck, employeesMissingShifts, shiftCapViolations, cappedFixedDayViolations, weekendPairingMismatches, guaranteeGaps };
+  };
+
+  // Admin "Upload a schedule file": turns a CSV/XLSX in the wide layout
+  // (one row per employee, one column per day — same as "Export CSV")
+  // into a full schedule snapshot, going through the exact same
+  // holesOnDay/buildScheduleDerived pipeline generate() itself uses, so
+  // an uploaded schedule is held to the same fairness/coverage reporting
+  // as a generated one. Matching is against whatever roster, shift list,
+  // and rotation window (numWeeks/startDate) are already configured for
+  // the account currently being viewed — this doesn't bring its own
+  // roster along the way the admin Import tab's Schedule section does.
+  const runScheduleUpload = async (file) => {
+    if (!file || uploadRunning) return;
+    const isXlsx = /\.xlsx?$/i.test(file.name);
+    if (!window.confirm(`Replace the current Schedule here with "${file.name}"? This overwrites the active schedule grid and cannot be undone.`)) return;
+    setUploadRunning(true);
+    setUploadResult(null);
+    try {
+      let rows;
+      if (isXlsx) {
+        const XLSX = await import("xlsx");
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: "" }).map((r) => r.map((c) => String(c ?? "")));
+      } else {
+        const text = await file.text();
+        rows = parseCsvText(text);
+      }
+
+      const plan = buildAssignmentPlan({ rows, days, permanent, extra, shiftDefsSorted });
+
+      const finalDays = days.map((d) => {
+        const assignment = plan.assignmentsByDayIdx[d.idx] || {};
+        const isWknd = d.isWeekend || holidays.has(d.iso);
+        return { ...d, isWknd, assignment, holes: holesOnDay({ ...d, isWknd, assignment }) };
+      });
+      const derived = buildScheduleDerived(finalDays);
+      // Same convention checkFairness() uses for a schedule no optimizer
+      // pass produced: a fresh cost measured on both sides, iterations
+      // zeroed, so the banner reads as "this is where things stand".
+      const freshCost = costOf(finalDays, finalDays.length);
+      const settingsUsed = { maxConsecutiveDays, consecutiveHardLimit, groupDaysOff, avoidLonelyShifts, weekendPairingEnabled, extendOffWeekends, cushionShiftCodes };
+      const snapshot = {
+        settingsUsed, costBefore: freshCost, costAfter: freshCost, iterations: 0, numWeeks, startDate,
+        forcedHolidayConflicts: [], pinnedShiftConflicts: [], pinnedShiftWarnings: [], autoRearrangedLosses: [],
+        ...derived,
+      };
+
+      setSchedule(snapshot);
+      setManualEditWarnings([]);
+      setKickedOutCells(new Set());
+      setMissingShiftCells(new Set());
+      setMissingShiftReport(null);
+      setDismissedAlerts(new Set());
+      await saveScheduleSnapshot(snapshot, viewingOwnerId);
+
+      if (plan.ptoUpdates.length > 0) {
+        setPtoStatus((prev) => {
+          const next = { ...prev };
+          plan.ptoUpdates.forEach((u) => { next[key(u.employee_id, finalDays.find((d) => d.iso === u.day_iso)?.idx)] = u.status; });
+          return next;
+        });
+        setPtoSource((prev) => {
+          const next = { ...prev };
+          plan.ptoUpdates.forEach((u) => { next[key(u.employee_id, finalDays.find((d) => d.iso === u.day_iso)?.idx)] = u.source; });
+          return next;
+        });
+        await bulkUpsertPtoStatus(plan.ptoUpdates.map((u) => ({ employee_id: u.employee_id, day_iso: u.day_iso, status: u.status, source: u.source, owner_id: viewingOwnerId })));
+      }
+
+      const summary = [
+        `Matched ${plan.matchedEmployeeCount} employee row(s) across ${days.length} day(s). Switch to the Schedule tab to see it.`,
+        plan.ptoUpdates.length > 0 ? `${plan.ptoUpdates.length} PTO/weekend-off cell(s) recorded.` : null,
+        derived.totalHoles > 0 ? `${derived.totalHoles} shift(s) still unfilled — see the red HOLE cells on the Schedule tab.` : null,
+      ].filter(Boolean);
+      if (plan.unmatchedEmployeeNames.length > 0) summary.push(`Not found in the current roster, skipped: ${plan.unmatchedEmployeeNames.join(", ")}.`);
+      if (plan.unmatchedColumns.length > 0) summary.push(`Column(s) that didn't match a day in the current rotation window, skipped: ${plan.unmatchedColumns.join(", ")}.`);
+      if (plan.unknownCodeCount > 0) summary.push(`${plan.unknownCodeCount} cell(s) had an unrecognized value — see details below.`);
+      setUploadResult({ summary, warnings: plan.warnings, error: null });
+    } catch (err) {
+      reportSyncError(err);
+      setUploadResult({ summary: [], warnings: [], error: err.message || String(err) });
+    } finally {
+      setUploadRunning(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
   };
 
   // Tops every extended-hour employee up to their guaranteed shift count
@@ -4489,6 +4586,34 @@ export default function ShiftFairnessSchedulerV4({ session, profile: initialProf
               <div className={`text-sm rounded px-3 py-2 ${importResult.error ? "bg-[#FEE2E2] border border-[#DC2626] text-[#991B1B]" : "bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46]"}`}>
                 {importResult.error ? <div className="font-semibold mb-1">Import failed partway through: {importResult.error}</div> : <div className="font-semibold mb-1">Import complete.</div>}
                 <AlertList items={importResult.summary} />
+              </div>
+            )}
+
+            <div className="bg-white rounded-lg border border-[#E4E7EC] p-4 space-y-2">
+              <div className="text-sm font-semibold">Upload a schedule file</div>
+              <p className="text-xs text-[#64748B]">
+                Replaces the active Schedule here (for {allProfiles.find((p) => p.id === viewingOwnerId)?.name || "you"}) from a CSV or XLSX file in the same layout "⬇ Export CSV" produces on the Schedule tab — one row per employee, one column per day. Matches employees by name against the roster already set up here, and days against the rotation window already configured in Setup, so both need to already cover what's in the file.
+              </p>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv,.xlsx,.xls"
+                disabled={uploadRunning}
+                onChange={(e) => runScheduleUpload(e.target.files?.[0])}
+                className="text-xs"
+              />
+              {uploadRunning && <div className="text-xs text-[#64748B]">Uploading…</div>}
+            </div>
+            {uploadResult && (
+              <div className={`text-sm rounded px-3 py-2 ${uploadResult.error ? "bg-[#FEE2E2] border border-[#DC2626] text-[#991B1B]" : "bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46]"}`}>
+                {uploadResult.error ? <div className="font-semibold mb-1">Upload failed: {uploadResult.error}</div> : <div className="font-semibold mb-1">Upload complete.</div>}
+                <AlertList items={uploadResult.summary} />
+                {uploadResult.warnings.length > 0 && (
+                  <details className="mt-1">
+                    <summary className="cursor-pointer text-xs font-semibold">{uploadResult.warnings.length} cell-level detail(s)</summary>
+                    <AlertList items={uploadResult.warnings} />
+                  </details>
+                )}
               </div>
             )}
           </div>
